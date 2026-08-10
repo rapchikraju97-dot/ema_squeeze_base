@@ -203,6 +203,13 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
         "volume": "sum",
     }).dropna()
 
+    # Drop the trailing bar if that week's Friday hasn't happened yet (e.g. running on Monday) —
+    # otherwise we'd evaluate an incomplete, still-forming weekly candle as if it were closed.
+    if len(weekly) > 0:
+        today = pd.Timestamp.now().normalize()
+        if weekly.index[-1] > today:
+            weekly = weekly.iloc[:-1]
+
     if len(weekly) < 45:
         return None
 
