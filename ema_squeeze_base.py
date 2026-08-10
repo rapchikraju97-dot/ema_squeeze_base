@@ -229,14 +229,26 @@ def build_monthly_trend(daily: pd.DataFrame) -> pd.DataFrame:
     return monthly[["monthly_uptrend"]]
 
 
+def _clean_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize an index to tz-naive, nanosecond-precision datetime64 so merge_asof never hits a dtype mismatch."""
+    idx = pd.to_datetime(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    df = df.copy()
+    df.index = idx.as_unit("ns")
+    return df
+
+
 def attach_monthly_trend(weekly: pd.DataFrame, monthly_trend: pd.DataFrame) -> pd.DataFrame:
     """
     For each weekly bar, attach the most recently COMPLETED month's uptrend flag
     (avoids look-ahead bias — only use months that had already closed).
     """
-    weekly = weekly.copy()
-    monthly_shifted = monthly_trend.copy()
+    weekly = _clean_datetime_index(weekly)
+
+    monthly_shifted = _clean_datetime_index(monthly_trend)
     monthly_shifted.index = monthly_shifted.index + pd.Timedelta(days=1)  # push to next day so merge_asof only sees completed months
+
     merged = pd.merge_asof(
         weekly.sort_index(), monthly_shifted.sort_index(),
         left_index=True, right_index=True, direction="backward",
