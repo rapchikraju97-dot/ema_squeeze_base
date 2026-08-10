@@ -2,7 +2,7 @@ name: EMA Squeeze Base Weekly Scan
 
 on:
   schedule:
-    - cron: '30 12 * * 5'
+    - cron: '30 12 * * 1,5'
   workflow_dispatch: {}
 
 jobs:
