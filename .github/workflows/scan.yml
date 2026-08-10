@@ -2,24 +2,29 @@ name: EMA Squeeze Base Weekly Scan
 
 on:
   schedule:
+    # Monday + Friday, 18:00 IST = 12:30 UTC
     - cron: '30 12 * * 1,5'
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab too
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 30   # 752 symbols with a 0.5s delay + downloads can take a while
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install yfinance pandas ta requests
+
       - name: Run scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
