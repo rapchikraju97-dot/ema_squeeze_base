@@ -280,10 +280,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # Scan logic
 # ---------------------------------------------------------------------------
 
-def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
+def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
+    """
+    Core rule evaluation, shared by check_row() and --explain mode.
+    Returns a dict of {condition_name: (passed: bool, detail: str)} plus the row/derived values,
+    or None if there isn't enough data at this index to evaluate at all.
+    """
     if idx < 1 or idx >= len(df):
         return None
-
     if idx < max(EMA40_TREND_LOOKBACK, PRIOR_RALLY_LOOKBACK, STACK_CONSISTENCY_WEEKS):
         return None
 
@@ -298,36 +302,58 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     ema_cluster = [row.ema5, row.ema10, row.ema20]
     compression = (max(ema_cluster) - min(ema_cluster)) / row.close
 
-    # sustained bullish stack: ema10 > ema20 > ema40 held for the last N consecutive weeks
-    stack_window = df.iloc[idx - STACK_CONSISTENCY_WEEKS + 1 : idx + 1]
-    stack_ok = ((stack_window["ema10"] > stack_window["ema20"]) &
-                (stack_window["ema20"] > stack_window["ema40"])).all()
+    stack_window = df.iloc[idx - STACK_CONSISTENCY_WEEKS + 1: idx + 1]
+    stack_ok = bool(((stack_window["ema10"] > stack_window["ema20"]) &
+                      (stack_window["ema20"] > stack_window["ema40"])).all())
 
-    # prior rally: close must be meaningfully above the lowest close in the prior lookback window
-    rally_window = df.iloc[idx - PRIOR_RALLY_LOOKBACK : idx]
+    rally_window = df.iloc[idx - PRIOR_RALLY_LOOKBACK: idx]
     prior_low = rally_window["close"].min()
-    prior_rally_ok = pd.notna(prior_low) and row.close >= prior_low * (1 + PRIOR_RALLY_MIN_GAIN)
+    prior_rally_ok = bool(pd.notna(prior_low) and row.close >= prior_low * (1 + PRIOR_RALLY_MIN_GAIN))
+    prior_rally_gain = (row.close / prior_low - 1) * 100 if pd.notna(prior_low) else float("nan")
 
-    # monthly macro trend: EMA6(monthly) > EMA20(monthly) — long-term uptrend confirmed
     monthly_uptrend_ok = bool(row.get("monthly_uptrend", False))
 
-    conditions = [
-        compression < EMA_COMPRESSION_THRESHOLD,
-        row.ema10 <= row.close <= row.ema10 * (1 + PRICE_ABOVE_EMA10_MAX_PCT),
-        row.close > row.ema40,
-        RSI_LOW <= row.rsi14 <= RSI_HIGH,
-        row.adx14 > ADX_MIN and row.adx14 > prev.adx14,
-        row.pdi14 > row.ndi14,
-        row.close >= NEAR_52W_HIGH_PCT * row.high_52w,               # near its 52-week high
-        row.ema40 > ema40_then * (1 + EMA40_MIN_RISE_PCT),           # 40W EMA meaningfully rising
-        min(ema_cluster) > row.ema40,                                  # whole cluster above the 40W EMA
-        stack_ok,                                                       # bullish stack sustained, not a one-off
-        prior_rally_ok,                                                 # a real rally preceded this base
-        monthly_uptrend_ok,                                             # monthly 6EMA > 20EMA — macro trend confirmed
-    ]
+    checks = {
+        "ema_compression":   (compression < EMA_COMPRESSION_THRESHOLD,
+                               f"{compression*100:.2f}% (need < {EMA_COMPRESSION_THRESHOLD*100:.0f}%)"),
+        "price_near_ema10":  (row.ema10 <= row.close <= row.ema10 * (1 + PRICE_ABOVE_EMA10_MAX_PCT),
+                               f"close {row.close:.2f} vs ema10 {row.ema10:.2f} (need within +{PRICE_ABOVE_EMA10_MAX_PCT*100:.0f}%, not below)"),
+        "price_above_ema40": (row.close > row.ema40,
+                               f"close {row.close:.2f} vs ema40 {row.ema40:.2f}"),
+        "rsi_band":          (RSI_LOW <= row.rsi14 <= RSI_HIGH,
+                               f"RSI {row.rsi14:.1f} (need {RSI_LOW}-{RSI_HIGH})"),
+        "adx_rising_above20": (row.adx14 > ADX_MIN and row.adx14 > prev.adx14,
+                               f"ADX {row.adx14:.1f} (prev {prev.adx14:.1f}, need >{ADX_MIN} and rising)"),
+        "pdi_above_ndi":     (row.pdi14 > row.ndi14,
+                               f"+DI {row.pdi14:.1f} vs -DI {row.ndi14:.1f}"),
+        "near_52w_high":     (row.close >= NEAR_52W_HIGH_PCT * row.high_52w,
+                               f"close {row.close:.2f} is {(row.close/row.high_52w)*100:.1f}% of 52W high {row.high_52w:.2f} (need >= {NEAR_52W_HIGH_PCT*100:.0f}%)"),
+        "ema40_rising":      (row.ema40 > ema40_then * (1 + EMA40_MIN_RISE_PCT),
+                               f"ema40 {row.ema40:.2f} vs {EMA40_TREND_LOOKBACK}w-ago {ema40_then:.2f} (need +{EMA40_MIN_RISE_PCT*100:.0f}%+)"),
+        "cluster_above_ema40": (min(ema_cluster) > row.ema40,
+                               f"min(5/10/20 EMA) {min(ema_cluster):.2f} vs ema40 {row.ema40:.2f}"),
+        "stack_sustained":   (stack_ok,
+                               f"ema10>ema20>ema40 held for last {STACK_CONSISTENCY_WEEKS} weeks: {stack_ok}"),
+        "prior_rally":       (prior_rally_ok,
+                               f"+{prior_rally_gain:.1f}% from {PRIOR_RALLY_LOOKBACK}w low (need >= +{PRIOR_RALLY_MIN_GAIN*100:.0f}%)"),
+        "monthly_uptrend":   (monthly_uptrend_ok,
+                               f"monthly EMA6>EMA20: {monthly_uptrend_ok}"),
+    }
+    return {"row": row, "checks": checks}
 
-    if not all(conditions):
+
+def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
+    evald = evaluate_conditions(df, idx)
+    if evald is None:
         return None
+
+    row = evald["row"]
+    checks = evald["checks"]
+    if not all(passed for passed, _ in checks.values()):
+        return None
+
+    ema_cluster = [row.ema5, row.ema10, row.ema20]
+    compression = (max(ema_cluster) - min(ema_cluster)) / row.close
 
     return ScanResult(
         symbol="",
@@ -415,6 +441,39 @@ def format_results_message(results: List[ScanResult]) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+def explain_symbol(symbol: str):
+    """Print a pass/fail breakdown of every condition for the latest week of one symbol."""
+    daily = fetch_daily_ohlc(symbol)
+    if daily is None:
+        print(f"{symbol}: could not fetch data.")
+        return
+
+    weekly = build_weekly(daily)
+    if weekly is None:
+        print(f"{symbol}: not enough weekly bars.")
+        return
+
+    monthly_trend = build_monthly_trend(daily)
+    weekly = attach_monthly_trend(weekly, monthly_trend)
+    weekly = compute_indicators(weekly)
+
+    evald = evaluate_conditions(weekly, len(weekly) - 1)
+    if evald is None:
+        print(f"{symbol}: not enough history to evaluate yet.")
+        return
+
+    row = evald["row"]
+    checks = evald["checks"]
+    print(f"\n=== {symbol} — week of {row.name.date()} — close {row.close:.2f} ===")
+    all_pass = True
+    for name, (passed, detail) in checks.items():
+        mark = "PASS" if passed else "FAIL"
+        if not passed:
+            all_pass = False
+        print(f"  [{mark}] {name}: {detail}")
+    print(f"  => OVERALL: {'MATCH' if all_pass else 'no match'}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="EMA Squeeze Base weekly scanner")
     parser.add_argument("--dry-run", action="store_true", help="Print results, skip Telegram send")
@@ -422,7 +481,13 @@ def main():
     parser.add_argument("--lookback-weeks", type=int, default=5, help="Weeks to check when --backtest is set")
     parser.add_argument("--delay", type=float, default=0.5, help="Seconds to sleep between symbol downloads")
     parser.add_argument("--limit", type=int, default=None, help="Only scan the first N symbols (useful for quick tests)")
+    parser.add_argument("--explain", type=str, default=None,
+                         help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
     args = parser.parse_args()
+
+    if args.explain:
+        explain_symbol(args.explain.upper())
+        return
 
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
     print(f"Scanning {len(symbols)} symbols...")
