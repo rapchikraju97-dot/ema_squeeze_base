@@ -44,16 +44,8 @@ from ta.trend import ADXIndicator
 # Config
 # ---------------------------------------------------------------------------
 
-EMA_COMPRESSION_THRESHOLD = 0.04      # 4% max spread among 5W/10W/20W EMAs
-PRICE_ABOVE_EMA10_MAX_PCT = 0.05      # close within 5% above the 10W EMA
-RSI_LOW, RSI_HIGH = 48, 58
-ADX_MIN = 20
-NEAR_52W_HIGH_PCT = 0.85               # close must be within 15% of the 52-week high (tightened)
-EMA40_TREND_LOOKBACK = 16              # weeks back to confirm ema40 is rising (was 8 — too short)
-EMA40_MIN_RISE_PCT = 0.03              # ema40 must have risen at least 3% over that lookback
-STACK_CONSISTENCY_WEEKS = 4            # bullish EMA order must hold for this many consecutive weeks
-PRIOR_RALLY_LOOKBACK = 26              # weeks to look back for the pre-base rally
-PRIOR_RALLY_MIN_GAIN = 0.20            # close must be >=20% above the lowest close in that lookback
+NEAR_EMA_PCT = 0.03    # close must be within 3% of the 10W or 20W EMA — the ONLY proximity rule
+UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and close > ema40
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -288,56 +280,26 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     """
     if idx < 1 or idx >= len(df):
         return None
-    if idx < max(EMA40_TREND_LOOKBACK, PRIOR_RALLY_LOOKBACK, STACK_CONSISTENCY_WEEKS):
-        return None
 
     row = df.iloc[idx]
-    prev = df.iloc[idx - 1]
-    ema40_then = df.iloc[idx - EMA40_TREND_LOOKBACK]["ema40"]
 
-    required = ["ema5", "ema10", "ema20", "ema40", "rsi14", "adx14", "pdi14", "ndi14", "high_52w"]
-    if row[required].isna().any() or pd.isna(prev["adx14"]) or pd.isna(ema40_then):
+    required = ["ema5", "ema10", "ema20", "ema40"]
+    if row[required].isna().any():
         return None
 
-    ema_cluster = [row.ema5, row.ema10, row.ema20]
-    compression = (max(ema_cluster) - min(ema_cluster)) / row.close
+    dist_ema10 = abs(row.close - row.ema10) / row.close
+    dist_ema20 = abs(row.close - row.ema20) / row.close
+    near_ema10 = dist_ema10 <= NEAR_EMA_PCT
+    near_ema20 = dist_ema20 <= NEAR_EMA_PCT
+    near_either = near_ema10 or near_ema20
 
-    stack_window = df.iloc[idx - STACK_CONSISTENCY_WEEKS + 1: idx + 1]
-    stack_ok = bool(((stack_window["ema10"] > stack_window["ema20"]) &
-                      (stack_window["ema20"] > stack_window["ema40"])).all())
-
-    rally_window = df.iloc[idx - PRIOR_RALLY_LOOKBACK: idx]
-    prior_low = rally_window["close"].min()
-    prior_rally_ok = bool(pd.notna(prior_low) and row.close >= prior_low * (1 + PRIOR_RALLY_MIN_GAIN))
-    prior_rally_gain = (row.close / prior_low - 1) * 100 if pd.notna(prior_low) else float("nan")
-
-    monthly_uptrend_ok = bool(row.get("monthly_uptrend", False))
+    uptrend_ok = bool(row.ema10 > row.ema20 > row.ema40 and row.close > row.ema40)
 
     checks = {
-        "ema_compression":   (compression < EMA_COMPRESSION_THRESHOLD,
-                               f"{compression*100:.2f}% (need < {EMA_COMPRESSION_THRESHOLD*100:.0f}%)"),
-        "price_near_ema10":  (row.ema10 <= row.close <= row.ema10 * (1 + PRICE_ABOVE_EMA10_MAX_PCT),
-                               f"close {row.close:.2f} vs ema10 {row.ema10:.2f} (need within +{PRICE_ABOVE_EMA10_MAX_PCT*100:.0f}%, not below)"),
-        "price_above_ema40": (row.close > row.ema40,
-                               f"close {row.close:.2f} vs ema40 {row.ema40:.2f}"),
-        "rsi_band":          (RSI_LOW <= row.rsi14 <= RSI_HIGH,
-                               f"RSI {row.rsi14:.1f} (need {RSI_LOW}-{RSI_HIGH})"),
-        "adx_rising_above20": (row.adx14 > ADX_MIN and row.adx14 > prev.adx14,
-                               f"ADX {row.adx14:.1f} (prev {prev.adx14:.1f}, need >{ADX_MIN} and rising)"),
-        "pdi_above_ndi":     (row.pdi14 > row.ndi14,
-                               f"+DI {row.pdi14:.1f} vs -DI {row.ndi14:.1f}"),
-        "near_52w_high":     (row.close >= NEAR_52W_HIGH_PCT * row.high_52w,
-                               f"close {row.close:.2f} is {(row.close/row.high_52w)*100:.1f}% of 52W high {row.high_52w:.2f} (need >= {NEAR_52W_HIGH_PCT*100:.0f}%)"),
-        "ema40_rising":      (row.ema40 > ema40_then * (1 + EMA40_MIN_RISE_PCT),
-                               f"ema40 {row.ema40:.2f} vs {EMA40_TREND_LOOKBACK}w-ago {ema40_then:.2f} (need +{EMA40_MIN_RISE_PCT*100:.0f}%+)"),
-        "cluster_above_ema40": (min(ema_cluster) > row.ema40,
-                               f"min(5/10/20 EMA) {min(ema_cluster):.2f} vs ema40 {row.ema40:.2f}"),
-        "stack_sustained":   (stack_ok,
-                               f"ema10>ema20>ema40 held for last {STACK_CONSISTENCY_WEEKS} weeks: {stack_ok}"),
-        "prior_rally":       (prior_rally_ok,
-                               f"+{prior_rally_gain:.1f}% from {PRIOR_RALLY_LOOKBACK}w low (need >= +{PRIOR_RALLY_MIN_GAIN*100:.0f}%)"),
-        "monthly_uptrend":   (monthly_uptrend_ok,
-                               f"monthly EMA6>EMA20: {monthly_uptrend_ok}"),
+        "near_10w_or_20w_ema": (near_either,
+            f"close {row.close:.2f} | dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to either)"),
+        "uptrend":            (uptrend_ok if UPTREND_REQUIRED else True,
+            f"ema10 {row.ema10:.2f} > ema20 {row.ema20:.2f} > ema40 {row.ema40:.2f}, close {row.close:.2f} > ema40: {uptrend_ok}"),
     }
     return {"row": row, "checks": checks}
 
@@ -352,8 +314,8 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     if not all(passed for passed, _ in checks.values()):
         return None
 
-    ema_cluster = [row.ema5, row.ema10, row.ema20]
-    compression = (max(ema_cluster) - min(ema_cluster)) / row.close
+    dist_ema10 = abs(row.close - row.ema10) / row.close
+    dist_ema20 = abs(row.close - row.ema20) / row.close
 
     return ScanResult(
         symbol="",
@@ -362,11 +324,11 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         ema10=round(row.ema10, 2),
         ema20=round(row.ema20, 2),
         ema40=round(row.ema40, 2),
-        rsi14=round(row.rsi14, 2),
-        adx14=round(row.adx14, 2),
-        pdi14=round(row.pdi14, 2),
-        ndi14=round(row.ndi14, 2),
-        compression_pct=round(compression * 100, 2),
+        rsi14=round(row.rsi14, 2) if pd.notna(row.get("rsi14")) else None,
+        adx14=round(row.adx14, 2) if pd.notna(row.get("adx14")) else None,
+        pdi14=round(row.pdi14, 2) if pd.notna(row.get("pdi14")) else None,
+        ndi14=round(row.ndi14, 2) if pd.notna(row.get("ndi14")) else None,
+        compression_pct=round(min(dist_ema10, dist_ema20) * 100, 2),
         week_date=str(row.name.date()),
     )
 
@@ -382,8 +344,6 @@ def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int) -> List[ScanRe
         print(f"  [{symbol}] skipped — not enough weekly bars")
         return []
 
-    monthly_trend = build_monthly_trend(daily)
-    weekly = attach_monthly_trend(weekly, monthly_trend)
     weekly = compute_indicators(weekly)
     results = []
 
@@ -453,8 +413,6 @@ def explain_symbol(symbol: str):
         print(f"{symbol}: not enough weekly bars.")
         return
 
-    monthly_trend = build_monthly_trend(daily)
-    weekly = attach_monthly_trend(weekly, monthly_trend)
     weekly = compute_indicators(weekly)
 
     evald = evaluate_conditions(weekly, len(weekly) - 1)
