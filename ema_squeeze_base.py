@@ -177,10 +177,10 @@ class ScanResult:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def fetch_weekly_ohlc(symbol: str, period: str = "3y") -> Optional[pd.DataFrame]:
+def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
     """
-    Pull daily data via yfinance and resample to weekly (Mon-Fri, closing Friday).
-    Returns None if data is unavailable or too short to compute a 40-period EMA.
+    Pull raw daily data via yfinance. period=5y so we have enough history
+    for a stable 20-month EMA (needs ~5 years of daily bars).
     """
     ticker = f"{symbol}.NS"
     try:
@@ -198,20 +198,51 @@ def fetch_weekly_ohlc(symbol: str, period: str = "3y") -> Optional[pd.DataFrame]
     if isinstance(daily.columns, pd.MultiIndex):
         daily.columns = daily.columns.get_level_values(0)
 
-    weekly = daily.resample("W-FRI").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum",
-    }).dropna()
+    daily.columns = [c.lower() for c in daily.columns]
+    return daily
 
-    weekly.columns = [c.lower() for c in weekly.columns]
+
+def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
+    weekly = daily.resample("W-FRI").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna()
 
     if len(weekly) < 45:
         return None
 
     return weekly
+
+
+def build_monthly_trend(daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Monthly close, EMA6 and EMA20 on monthly close, and a bullish-cross flag
+    (EMA6 > EMA20 = long-term uptrend confirmed, matches RK's monthly exit rule).
+    """
+    monthly = daily.resample("ME").agg({"close": "last"}).dropna()
+    monthly["ema6_m"] = monthly["close"].ewm(span=6, adjust=False).mean()
+    monthly["ema20_m"] = monthly["close"].ewm(span=20, adjust=False).mean()
+    monthly["monthly_uptrend"] = monthly["ema6_m"] > monthly["ema20_m"]
+    return monthly[["monthly_uptrend"]]
+
+
+def attach_monthly_trend(weekly: pd.DataFrame, monthly_trend: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each weekly bar, attach the most recently COMPLETED month's uptrend flag
+    (avoids look-ahead bias — only use months that had already closed).
+    """
+    weekly = weekly.copy()
+    monthly_shifted = monthly_trend.copy()
+    monthly_shifted.index = monthly_shifted.index + pd.Timedelta(days=1)  # push to next day so merge_asof only sees completed months
+    merged = pd.merge_asof(
+        weekly.sort_index(), monthly_shifted.sort_index(),
+        left_index=True, right_index=True, direction="backward",
+    )
+    merged["monthly_uptrend"] = merged["monthly_uptrend"].fillna(False)
+    return merged
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -265,6 +296,9 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     prior_low = rally_window["close"].min()
     prior_rally_ok = pd.notna(prior_low) and row.close >= prior_low * (1 + PRIOR_RALLY_MIN_GAIN)
 
+    # monthly macro trend: EMA6(monthly) > EMA20(monthly) — long-term uptrend confirmed
+    monthly_uptrend_ok = bool(row.get("monthly_uptrend", False))
+
     conditions = [
         compression < EMA_COMPRESSION_THRESHOLD,
         row.ema10 <= row.close <= row.ema10 * (1 + PRICE_ABOVE_EMA10_MAX_PCT),
@@ -277,6 +311,7 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         min(ema_cluster) > row.ema40,                                  # whole cluster above the 40W EMA
         stack_ok,                                                       # bullish stack sustained, not a one-off
         prior_rally_ok,                                                 # a real rally preceded this base
+        monthly_uptrend_ok,                                             # monthly 6EMA > 20EMA — macro trend confirmed
     ]
 
     if not all(conditions):
@@ -299,11 +334,18 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
 
 
 def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int) -> List[ScanResult]:
-    weekly = fetch_weekly_ohlc(symbol)
-    if weekly is None:
+    daily = fetch_daily_ohlc(symbol)
+    if daily is None:
         print(f"  [{symbol}] skipped — insufficient data")
         return []
 
+    weekly = build_weekly(daily)
+    if weekly is None:
+        print(f"  [{symbol}] skipped — not enough weekly bars")
+        return []
+
+    monthly_trend = build_monthly_trend(daily)
+    weekly = attach_monthly_trend(weekly, monthly_trend)
     weekly = compute_indicators(weekly)
     results = []
 
