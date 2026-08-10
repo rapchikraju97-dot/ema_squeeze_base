@@ -1,61 +1,29 @@
-
-
-Ema squeeze base · PY
 """
-EMA Squeeze Base Scanner (symbols embedded — no external file needed)
------------------------------------------------------------------------
+EMA Squeeze Base Scanner (symbols embedded - no external file needed)
 Weekly-timeframe scan for RKScanBot.
- 
-Flags stocks where:
-  1. 5W / 10W / 20W EMAs are compressed (tight spread) relative to price
-  2. Close is at/just above the 10W EMA (not below it)
-  3. Close is above the 40W EMA (broader uptrend intact)
-  4. RSI(14) is holding the 48-58 support band
-  5. ADX(14) > 20 and rising vs. the prior week
-  6. +DI(14) > -DI(14) (trend direction still bullish)
- 
-Usage:
-    python ema_squeeze_base.py                # live run, sends Telegram alert
-    python ema_squeeze_base.py --dry-run       # prints results, no Telegram send
-    python ema_squeeze_base.py --backtest --lookback-weeks 20 --dry-run
-        (checks the last N weeks per symbol instead of just the latest —
-         use this first to validate against known winners like MTARTECH,
-         CUMMINSIND, APARINDS before trusting it live)
- 
-Requirements:
-    pip install yfinance pandas ta requests
- 
-Environment variables (for Telegram):
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
 """
- 
+
 import argparse
 import os
 import sys
 import time
 from dataclasses import dataclass
 from typing import List, Optional
- 
+
 import pandas as pd
 import requests
 import yfinance as yf
 from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator
- 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
- 
-EMA_COMPRESSION_THRESHOLD = 0.04      # 4% max spread among 5W/10W/20W EMAs
-PRICE_ABOVE_EMA10_MAX_PCT = 0.05      # close within 5% above the 10W EMA
+
+EMA_COMPRESSION_THRESHOLD = 0.04
+PRICE_ABOVE_EMA10_MAX_PCT = 0.05
 RSI_LOW, RSI_HIGH = 48, 58
 ADX_MIN = 20
- 
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
- 
-# NSE symbols — Nifty Total Market list (752 symbols), no .NS suffix
+
 SYMBOLS = [
     "360ONE", "3MINDIA", "ABB", "ACC", "ACMESOLAR", "AIAENG", "APLAPOLLO", "ASKAUTOLTD",
     "AUBANK", "AWL", "AXISCADES", "AADHARHFC", "AARTIDRUGS", "AARTIIND", "AARTIPHARM", "AAVAS",
@@ -152,8 +120,8 @@ SYMBOLS = [
     "WELENT", "WELSPUNLIV", "WESTLIFE", "WHIRLPOOL", "WIPRO", "WOCKPHARMA", "YATHARTH", "YESBANK",
     "ZFCVINDIA", "ZAGGLE", "ZEEL", "ZENTEC", "ZENSARTECH", "ZYDUSLIFE", "ZYDUSWELL", "ECLERX"
 ]
- 
- 
+
+
 @dataclass
 class ScanResult:
     symbol: str
@@ -168,17 +136,9 @@ class ScanResult:
     ndi14: float
     compression_pct: float
     week_date: str
- 
- 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
- 
+
+
 def fetch_weekly_ohlc(symbol: str, period: str = "3y") -> Optional[pd.DataFrame]:
-    """
-    Pull daily data via yfinance and resample to weekly (Mon-Fri, closing Friday).
-    Returns None if data is unavailable or too short to compute a 40-period EMA.
-    """
     ticker = f"{symbol}.NS"
     try:
         daily = yf.download(
@@ -188,13 +148,13 @@ def fetch_weekly_ohlc(symbol: str, period: str = "3y") -> Optional[pd.DataFrame]
     except Exception as e:
         print(f"  [{symbol}] download error: {e}")
         return None
- 
+
     if daily.empty:
         return None
- 
+
     if isinstance(daily.columns, pd.MultiIndex):
         daily.columns = daily.columns.get_level_values(0)
- 
+
     weekly = daily.resample("W-FRI").agg({
         "Open": "first",
         "High": "max",
@@ -202,50 +162,46 @@ def fetch_weekly_ohlc(symbol: str, period: str = "3y") -> Optional[pd.DataFrame]
         "Close": "last",
         "Volume": "sum",
     }).dropna()
- 
+
     weekly.columns = [c.lower() for c in weekly.columns]
- 
+
     if len(weekly) < 45:
         return None
- 
+
     return weekly
- 
- 
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
     df["ema10"] = df["close"].ewm(span=10, adjust=False).mean()
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema40"] = df["close"].ewm(span=40, adjust=False).mean()
- 
+
     df["rsi14"] = RSIIndicator(close=df["close"], window=14).rsi()
- 
+
     adx_ind = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14)
     df["adx14"] = adx_ind.adx()
     df["pdi14"] = adx_ind.adx_pos()
     df["ndi14"] = adx_ind.adx_neg()
- 
+
     return df
- 
- 
-# ---------------------------------------------------------------------------
-# Scan logic
-# ---------------------------------------------------------------------------
- 
+
+
 def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     if idx < 1 or idx >= len(df):
         return None
- 
+
     row = df.iloc[idx]
     prev = df.iloc[idx - 1]
- 
+
     required = ["ema5", "ema10", "ema20", "ema40", "rsi14", "adx14", "pdi14", "ndi14"]
     if row[required].isna().any() or pd.isna(prev["adx14"]):
         return None
- 
+
     ema_cluster = [row.ema5, row.ema10, row.ema20]
     compression = (max(ema_cluster) - min(ema_cluster)) / row.close
- 
+
     conditions = [
         compression < EMA_COMPRESSION_THRESHOLD,
         row.ema10 <= row.close <= row.ema10 * (1 + PRICE_ABOVE_EMA10_MAX_PCT),
@@ -254,10 +210,10 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         row.adx14 > ADX_MIN and row.adx14 > prev.adx14,
         row.pdi14 > row.ndi14,
     ]
- 
+
     if not all(conditions):
         return None
- 
+
     return ScanResult(
         symbol="",
         close=round(row.close, 2),
@@ -272,17 +228,17 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         compression_pct=round(compression * 100, 2),
         week_date=str(row.name.date()),
     )
- 
- 
+
+
 def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int) -> List[ScanResult]:
     weekly = fetch_weekly_ohlc(symbol)
     if weekly is None:
-        print(f"  [{symbol}] skipped — insufficient data")
+        print(f"  [{symbol}] skipped - insufficient data")
         return []
- 
+
     weekly = compute_indicators(weekly)
     results = []
- 
+
     if backtest:
         start_idx = max(1, len(weekly) - lookback_weeks)
         for i in range(start_idx, len(weekly)):
@@ -295,20 +251,16 @@ def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int) -> List[ScanRe
         if r:
             r.symbol = symbol
             results.append(r)
- 
+
     return results
- 
- 
-# ---------------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------------
- 
+
+
 def send_telegram_message(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials not set (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — skipping send.")
+        print("Telegram credentials not set - skipping send.")
         print(text)
         return
- 
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
@@ -316,13 +268,13 @@ def send_telegram_message(text: str):
         resp.raise_for_status()
     except Exception as e:
         print(f"Telegram send failed: {e}")
- 
- 
+
+
 def format_results_message(results: List[ScanResult]) -> str:
     if not results:
         return "*EMA Squeeze Base Scan*\nNo matches this week."
- 
-    lines = [f"*EMA Squeeze Base Scan* — {len(results)} match(es)\n"]
+
+    lines = [f"*EMA Squeeze Base Scan* - {len(results)} match(es)\n"]
     for r in results:
         lines.append(
             f"*{r.symbol}* ({r.week_date})\n"
@@ -331,40 +283,34 @@ def format_results_message(results: List[ScanResult]) -> str:
             f"  EMA compression: {r.compression_pct}%\n"
         )
     return "\n".join(lines)
- 
- 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
- 
+
+
 def main():
     parser = argparse.ArgumentParser(description="EMA Squeeze Base weekly scanner")
-    parser.add_argument("--dry-run", action="store_true", help="Print results, skip Telegram send")
-    parser.add_argument("--backtest", action="store_true", help="Check the last N weeks instead of just the latest")
-    parser.add_argument("--lookback-weeks", type=int, default=5, help="Weeks to check when --backtest is set")
-    parser.add_argument("--delay", type=float, default=0.5, help="Seconds to sleep between symbol downloads")
-    parser.add_argument("--limit", type=int, default=None, help="Only scan the first N symbols (useful for quick tests)")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--backtest", action="store_true")
+    parser.add_argument("--lookback-weeks", type=int, default=5)
+    parser.add_argument("--delay", type=float, default=0.5)
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
- 
+
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
     print(f"Scanning {len(symbols)} symbols...")
- 
+
     all_results: List[ScanResult] = []
     for i, symbol in enumerate(symbols, 1):
         print(f"[{i}/{len(symbols)}] {symbol}")
         results = scan_symbol(symbol, backtest=args.backtest, lookback_weeks=args.lookback_weeks)
         all_results.extend(results)
         time.sleep(args.delay)
- 
+
     print(f"\n{len(all_results)} match(es) found.")
     message = format_results_message(all_results)
     print(message)
- 
+
     if not args.dry_run:
         send_telegram_message(message)
- 
- 
+
+
 if __name__ == "__main__":
     main()
- 
-
