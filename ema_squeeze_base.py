@@ -367,6 +367,30 @@ def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int) -> List[ScanRe
 # Telegram
 # ---------------------------------------------------------------------------
 
+TELEGRAM_MAX_CHARS = 4000  # Telegram's hard limit is 4096; leave headroom
+
+
+def _split_message_into_chunks(text: str, max_chars: int = TELEGRAM_MAX_CHARS) -> List[str]:
+    """Split a long message into chunks that fit Telegram's per-message limit,
+    breaking on blank lines between entries so a stock's block never gets cut in half."""
+    if len(text) <= max_chars:
+        return [text]
+
+    blocks = text.split("\n\n")
+    chunks = []
+    current = ""
+    for block in blocks:
+        candidate = (current + "\n\n" + block) if current else block
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def send_telegram_message(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials not set (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — skipping send.")
@@ -374,12 +398,20 @@ def send_telegram_message(text: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    try:
-        resp = requests.post(url, data=payload, timeout=10)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
+    chunks = _split_message_into_chunks(text)
+    if len(chunks) > 1:
+        print(f"Message is {len(text)} chars — splitting into {len(chunks)} Telegram messages.")
+
+    for i, chunk in enumerate(chunks, 1):
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
+        try:
+            resp = requests.post(url, data=payload, timeout=10)
+            resp.raise_for_status()
+            print(f"Telegram chunk {i}/{len(chunks)} sent OK.")
+        except Exception as e:
+            body = getattr(e, "response", None)
+            body_text = body.text if body is not None else ""
+            print(f"Telegram send failed on chunk {i}/{len(chunks)}: {e} {body_text}")
 
 
 def format_results_message(results: List[ScanResult]) -> str:
