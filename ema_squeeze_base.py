@@ -384,15 +384,19 @@ def send_telegram_message(text: str):
 
 def format_results_message(results: List[ScanResult]) -> str:
     if not results:
-        return "*EMA Squeeze Base Scan*\nNo matches this week."
+        return "*Near 10W/20W EMA Scan*\nNo matches this week."
 
-    lines = [f"*EMA Squeeze Base Scan* — {len(results)} match(es)\n"]
+    lines = [f"*Near 10W/20W EMA Scan* — {len(results)} match(es)\n"]
     for r in results:
+        dist_10 = abs(r.close - r.ema10) / r.close * 100
+        dist_20 = abs(r.close - r.ema20) / r.close * 100
+        rsi_txt = f"{r.rsi14:.1f}" if r.rsi14 is not None else "n/a"
+        adx_txt = f"{r.adx14:.1f}" if r.adx14 is not None else "n/a"
         lines.append(
             f"*{r.symbol}* ({r.week_date})\n"
-            f"  Close: {r.close} | EMA10: {r.ema10} | EMA40: {r.ema40}\n"
-            f"  RSI: {r.rsi14} | ADX: {r.adx14} (+DI {r.pdi14} / -DI {r.ndi14})\n"
-            f"  EMA compression: {r.compression_pct}%\n"
+            f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
+            f"  Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
+            f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
         )
     return "\n".join(lines)
 
