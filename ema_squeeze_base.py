@@ -48,8 +48,12 @@ EMA_COMPRESSION_THRESHOLD = 0.04      # 4% max spread among 5W/10W/20W EMAs
 PRICE_ABOVE_EMA10_MAX_PCT = 0.05      # close within 5% above the 10W EMA
 RSI_LOW, RSI_HIGH = 48, 58
 ADX_MIN = 20
-NEAR_52W_HIGH_PCT = 0.70               # close must be within 30% of the 52-week high
-EMA40_TREND_LOOKBACK = 8               # weeks back to confirm ema40 is rising
+NEAR_52W_HIGH_PCT = 0.85               # close must be within 15% of the 52-week high (tightened)
+EMA40_TREND_LOOKBACK = 16              # weeks back to confirm ema40 is rising (was 8 — too short)
+EMA40_MIN_RISE_PCT = 0.03              # ema40 must have risen at least 3% over that lookback
+STACK_CONSISTENCY_WEEKS = 4            # bullish EMA order must hold for this many consecutive weeks
+PRIOR_RALLY_LOOKBACK = 26              # weeks to look back for the pre-base rally
+PRIOR_RALLY_MIN_GAIN = 0.20            # close must be >=20% above the lowest close in that lookback
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -237,7 +241,7 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     if idx < 1 or idx >= len(df):
         return None
 
-    if idx < EMA40_TREND_LOOKBACK:
+    if idx < max(EMA40_TREND_LOOKBACK, PRIOR_RALLY_LOOKBACK, STACK_CONSISTENCY_WEEKS):
         return None
 
     row = df.iloc[idx]
@@ -251,6 +255,16 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     ema_cluster = [row.ema5, row.ema10, row.ema20]
     compression = (max(ema_cluster) - min(ema_cluster)) / row.close
 
+    # sustained bullish stack: ema10 > ema20 > ema40 held for the last N consecutive weeks
+    stack_window = df.iloc[idx - STACK_CONSISTENCY_WEEKS + 1 : idx + 1]
+    stack_ok = ((stack_window["ema10"] > stack_window["ema20"]) &
+                (stack_window["ema20"] > stack_window["ema40"])).all()
+
+    # prior rally: close must be meaningfully above the lowest close in the prior lookback window
+    rally_window = df.iloc[idx - PRIOR_RALLY_LOOKBACK : idx]
+    prior_low = rally_window["close"].min()
+    prior_rally_ok = pd.notna(prior_low) and row.close >= prior_low * (1 + PRIOR_RALLY_MIN_GAIN)
+
     conditions = [
         compression < EMA_COMPRESSION_THRESHOLD,
         row.ema10 <= row.close <= row.ema10 * (1 + PRICE_ABOVE_EMA10_MAX_PCT),
@@ -258,10 +272,11 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         RSI_LOW <= row.rsi14 <= RSI_HIGH,
         row.adx14 > ADX_MIN and row.adx14 > prev.adx14,
         row.pdi14 > row.ndi14,
-        # NEW: must be an established uptrend, not a flat/downtrending stock
-        row.close >= NEAR_52W_HIGH_PCT * row.high_52w,          # near its 52-week high
-        row.ema40 > ema40_then,                                  # 40W EMA itself is rising
-        min(ema_cluster) > row.ema40,                             # whole cluster sits above the 40W EMA
+        row.close >= NEAR_52W_HIGH_PCT * row.high_52w,               # near its 52-week high
+        row.ema40 > ema40_then * (1 + EMA40_MIN_RISE_PCT),           # 40W EMA meaningfully rising
+        min(ema_cluster) > row.ema40,                                  # whole cluster above the 40W EMA
+        stack_ok,                                                       # bullish stack sustained, not a one-off
+        prior_rally_ok,                                                 # a real rally preceded this base
     ]
 
     if not all(conditions):
