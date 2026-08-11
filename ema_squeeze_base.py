@@ -2,7 +2,7 @@
 EMA Squeeze Base Scanner
 -----------------------------------------------------------------------
 Weekly-timeframe scan integrated with Monthly Macro Trend confirmation 
-and robust Telegram dispatch with Markdown fallback.
+and robust Telegram dispatch with strict character-safe chunking & Markdown fallback.
 """
 
 import argparse
@@ -525,25 +525,35 @@ def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int) -> List[ScanRe
 # Telegram Formatting & Dispatch
 # ---------------------------------------------------------------------------
 
-TELEGRAM_MAX_CHARS = 4000
-
-def _split_message_into_chunks(text: str, max_chars: int = TELEGRAM_MAX_CHARS) -> List[str]:
+def _split_message_into_chunks(text: str, max_chars: int = 3800) -> List[str]:
+    """Strictly split message text into chunks safely under Telegram's per-message character limit."""
     if len(text) <= max_chars:
         return [text]
 
-    blocks = text.split("\n\n")
     chunks = []
-    current = ""
-    for block in blocks:
-        candidate = (current + "\n\n" + block) if current else block
-        if len(candidate) > max_chars and current:
-            chunks.append(current)
-            current = block
+    current_chunk = ""
+    lines = text.split("\n")
+    
+    for line in lines:
+        if len(line) > max_chars:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            for i in range(0, len(line), max_chars):
+                chunks.append(line[i:i + max_chars])
+            continue
+
+        candidate = (current_chunk + "\n" + line) if current_chunk else line
+        if len(candidate) > max_chars:
+            chunks.append(current_chunk.strip())
+            current_chunk = line
         else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    return chunks
+            current_chunk = candidate
+            
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+        
+    return [c for c in chunks if c]
 
 
 def format_results_message(results: List[ScanResult]) -> str:
