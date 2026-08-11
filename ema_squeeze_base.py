@@ -1,20 +1,8 @@
 """
-EMA Squeeze Base Scanner with Monthly Confluence (RKScanBot)
+EMA Squeeze Base Scanner
 -----------------------------------------------------------------------
-Weekly-timeframe scan integrated with Monthly Macro Trend confirmation.
-
-Flags stocks where:
-  1. 5W / 10W / 20W EMAs are compressed relative to price
-  2. Close is at/just above the 10W or 20W EMA
-  3. Close is above the 40W EMA (broader uptrend intact)
-  4. RSI(14) is holding the 48-58 support band
-  5. ADX(14) > 20 and rising vs. the prior week
-  6. +DI(14) > -DI(14) (trend direction still bullish)
-
-Tiering System:
-  - Tactical Match: Weekly setup only.
-  - High-Conviction Match (⭐): Weekly setup + Monthly Macro confirmation 
-    (6M EMA > 20M EMA and price retesting the 6M EMA).
+Weekly-timeframe scan integrated with Monthly Macro Trend confirmation 
+and robust Telegram dispatch with Markdown fallback.
 """
 
 import argparse
@@ -537,6 +525,27 @@ def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int) -> List[ScanRe
 # Telegram Formatting & Dispatch
 # ---------------------------------------------------------------------------
 
+TELEGRAM_MAX_CHARS = 4000
+
+def _split_message_into_chunks(text: str, max_chars: int = TELEGRAM_MAX_CHARS) -> List[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    blocks = text.split("\n\n")
+    chunks = []
+    current = ""
+    for block in blocks:
+        candidate = (current + "\n\n" + block) if current else block
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def format_results_message(results: List[ScanResult]) -> str:
     if not results:
         return "*EMA Squeeze Base Scan*\nNo matches this week."
@@ -549,7 +558,6 @@ def format_results_message(results: List[ScanResult]) -> str:
     if high_conviction:
         lines.append(f"🔥 *High-Conviction Tier (Weekly + Monthly Confluence)*: {len(high_conviction)}")
         for r in high_conviction:
-            dist_10 = abs(r.close - r.ema10) / r.close * 100
             lines.append(
                 f"⭐ *{r.symbol}* ({r.week_date}) [{r.sector}]\n"
                 f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20}\n"
@@ -574,13 +582,29 @@ def send_telegram_message(text: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    try:
-        resp = requests.post(url, data=payload, timeout=10)
-        resp.raise_for_status()
-        print("Telegram alert sent successfully.")
-    except Exception as e:
-        print(f"Telegram dispatch failed: {e}")
+    chunks = _split_message_into_chunks(text)
+    
+    for i, chunk in enumerate(chunks, 1):
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID, 
+            "text": chunk, 
+            "parse_mode": "Markdown"
+        }
+        try:
+            resp = requests.post(url, data=payload, timeout=10)
+            
+            # Fallback to plain text if Telegram rejects markdown syntax (400 Bad Request)
+            if resp.status_code == 400:
+                print(f"Markdown parse warning on chunk {i}. Retrying as plain text...")
+                payload.pop("parse_mode")
+                resp = requests.post(url, data=payload, timeout=10)
+
+            resp.raise_for_status()
+            print(f"Telegram chunk {i}/{len(chunks)} sent OK.")
+        except Exception as e:
+            body = getattr(e, "response", None)
+            body_text = body.text if body is not None else ""
+            print(f"Telegram send failed on chunk {i}/{len(chunks)}: {e} | Response: {body_text}")
 
 
 # ---------------------------------------------------------------------------
