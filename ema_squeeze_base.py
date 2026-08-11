@@ -3,8 +3,8 @@ EMA Squeeze Base Scanner with Monthly Confluence & Volume-Weighted RS (RKScanBot
 -----------------------------------------------------------------------
 Weekly-timeframe scan integrated with balanced Monthly Macro Trend confirmation 
 (6M > 20M > 40M EMA alignment + Monthly RSI 55-63 + Support Test), 
-Volume-Weighted RS, and robust Telegram dispatch with strict character-safe 
-chunking & Markdown fallback.
+Background VW-RS floor (>= 40), and robust Telegram dispatch with strict 
+character-safe chunking & Markdown fallback.
 """
 
 import argparse
@@ -31,6 +31,7 @@ ADX_MIN = 20               # Weekly ADX(14) must be at least this
 MONTHLY_EMA_PROXIMITY = 0.05 # Monthly close within 5% of 6M or 20M EMA support
 MONTHLY_RSI_MIN = 55       # Monthly RSI(14) minimum floor
 MONTHLY_RSI_MAX = 63       # Monthly RSI(14) maximum ceiling for flexibility
+VWRS_MIN_FLOOR = 40.0      # Hard background filter: drop stocks with VW-RS < 40
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -509,11 +510,17 @@ def check_row(weekly_df: pd.DataFrame, daily_df: pd.DataFrame, idx: int, symbol:
     if not all(passed for passed, _ in checks.values()):
         return None
 
+    # Compute Volume-Weighted Relative Strength
+    vwrs_score = compute_volume_weighted_rs(weekly_df)
+    
+    # Background Hard Floor Filter: Skip stocks with VW-RS below 40
+    if vwrs_score < VWRS_MIN_FLOOR:
+        return None
+
     dist_ema10 = abs(row.close - row.ema10) / row.close
     dist_ema20 = abs(row.close - row.ema20) / row.close
     
     monthly_confirmed = check_monthly_confluence(daily_df)
-    vwrs_score = compute_volume_weighted_rs(weekly_df)
 
     return ScanResult(
         symbol=symbol,
@@ -668,7 +675,7 @@ def main():
     args = parser.parse_args()
 
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
-    print(f"Scanning {len(symbols)} symbols with Monthly RSI (55-63) Confluence & VW-RS...")
+    print(f"Scanning {len(symbols)} symbols with VW-RS Floor (>=40) & Monthly RSI (55-63)...")
 
     all_results: List[ScanResult] = []
     for i, symbol in enumerate(symbols, 1):
