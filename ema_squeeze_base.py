@@ -46,6 +46,7 @@ from ta.trend import ADXIndicator
 
 NEAR_EMA_PCT = 0.03    # close must be within 3% of the 10W or 20W EMA — the ONLY proximity rule
 UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and close > ema40
+ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out weak/no-trend stocks
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -302,11 +303,16 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
 
     uptrend_ok = bool(row.ema10 > row.ema20 > row.ema40 and row.close > row.ema40)
 
+    adx_val = row.get("adx14", float("nan"))
+    adx_ok = bool(pd.notna(adx_val) and adx_val >= ADX_MIN)
+
     checks = {
         "near_10w_or_20w_ema": (near_either,
             f"close {row.close:.2f} | dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to either)"),
         "uptrend":            (uptrend_ok if UPTREND_REQUIRED else True,
             f"ema10 {row.ema10:.2f} > ema20 {row.ema20:.2f} > ema40 {row.ema40:.2f}, close {row.close:.2f} > ema40: {uptrend_ok}"),
+        "adx_min":            (adx_ok,
+            f"ADX {adx_val:.1f} (need >= {ADX_MIN})" if pd.notna(adx_val) else "ADX not available"),
     }
     return {"row": row, "checks": checks}
 
