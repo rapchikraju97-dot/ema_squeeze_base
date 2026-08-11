@@ -1,8 +1,9 @@
 """
-EMA Squeeze Base Scanner with Monthly Confluence & Volume Dynamics (RKScanBot)
+EMA Squeeze Base Scanner with Monthly Confluence & Volume-Weighted RS (RKScanBot)
 -----------------------------------------------------------------------
 Weekly-timeframe scan integrated with Monthly Macro Trend confirmation 
-(6M > 20M > 40M EMA alignment) and robust Telegram dispatch.
+(6M > 20M > 40M EMA alignment + Monthly RSI >= 60), Volume-Weighted RS, 
+and robust Telegram dispatch with strict character-safe chunking & Markdown fallback.
 """
 
 import argparse
@@ -28,6 +29,7 @@ ADX_MIN = 20               # Weekly ADX(14) must be at least this
 
 MONTHLY_EMA_PROXIMITY = 0.03 # Monthly close within 3% of 6M EMA for confluence check
 MAX_CROSS_LOOKBACK = 8     # Max months ago the 6M/20M EMA monthly cross could have happened
+MONTHLY_RSI_MIN = 60       # Monthly RSI(14) must be >= 60 for high-conviction tier
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -336,12 +338,13 @@ class ScanResult:
     ndi14: float
     compression_pct: float
     week_date: str
+    vw_rs_score: float = 0.0
     monthly_confirmed: bool = False
     sector: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
-# Data loading & Multi-Timeframe Checks
+# Data loading & Indicators
 # ---------------------------------------------------------------------------
 
 def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
@@ -384,6 +387,26 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
     return weekly
 
 
+def compute_volume_weighted_rs(weekly_df: pd.DataFrame) -> float:
+    """
+    Computes a Volume-Weighted Relative Strength score over the last 12 weeks.
+    Rewards weeks where the stock closes positive and volume exceeds its 10-week average.
+    """
+    if len(weekly_df) < 15:
+        return 0.0
+
+    df = weekly_df.copy()
+    df["vol_sma10"] = df["volume"].rolling(window=10).mean()
+    df["return"] = df["close"].pct_change()
+    df["vol_weight"] = df["volume"] / df["vol_sma10"].replace(0, 1)
+    
+    recent = df.iloc[-12:].copy()
+    recent["vw_score"] = recent["return"] * recent["vol_weight"]
+    
+    vwrs_value = recent["vw_score"].sum() * 100
+    return round(float(vwrs_value), 2)
+
+
 def check_monthly_confluence(daily: pd.DataFrame) -> bool:
     monthly = daily.resample("ME").agg({
         "close": "last"
@@ -401,6 +424,7 @@ def check_monthly_confluence(daily: pd.DataFrame) -> bool:
     monthly["ema20"] = monthly["close"].ewm(span=20, adjust=False).mean()
     monthly["ema40"] = monthly["close"].ewm(span=40, adjust=False).mean()
     
+    monthly["rsi14"] = RSIIndicator(close=monthly["close"], window=14).rsi()
     monthly["cross"] = monthly["ema6"] > monthly["ema20"]
     monthly["cross_change"] = monthly["cross"].astype(int).diff()
 
@@ -409,7 +433,10 @@ def check_monthly_confluence(daily: pd.DataFrame) -> bool:
     # Macro Rules: 
     # 1. Alignment check: 6M EMA > 20M EMA > 40M EMA
     # 2. Close > 20M EMA
-    if not (latest["ema6"] > latest["ema20"] > latest["ema40"] and latest["close"] > latest["ema20"]):
+    # 3. Monthly RSI(14) >= 60
+    if not (latest["ema6"] > latest["ema20"] > latest["ema40"] and 
+            latest["close"] > latest["ema20"] and 
+            pd.notna(latest["rsi14"]) and latest["rsi14"] >= MONTHLY_RSI_MIN):
         return False
 
     lookback_window = monthly.iloc[-MAX_CROSS_LOOKBACK:]
@@ -481,6 +508,7 @@ def check_row(weekly_df: pd.DataFrame, daily_df: pd.DataFrame, idx: int, symbol:
     dist_ema20 = abs(row.close - row.ema20) / row.close
     
     monthly_confirmed = check_monthly_confluence(daily_df)
+    vwrs_score = compute_volume_weighted_rs(weekly_df)
 
     return ScanResult(
         symbol=symbol,
@@ -495,6 +523,7 @@ def check_row(weekly_df: pd.DataFrame, daily_df: pd.DataFrame, idx: int, symbol:
         ndi14=round(row.ndi14, 2) if pd.notna(row.get("ndi14")) else 0.0,
         compression_pct=round(min(dist_ema10, dist_ema20) * 100, 2),
         week_date=str(row.name.date()),
+        vw_rs_score=vwrs_score,
         monthly_confirmed=monthly_confirmed,
         sector=SECTOR_MAP.get(symbol, "General")
     )
@@ -575,8 +604,8 @@ def format_results_message(results: List[ScanResult]) -> str:
         for r in high_conviction:
             lines.append(
                 f"⭐ *{r.symbol}* ({r.week_date}) [{r.sector}]\n"
-                f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20}\n"
-                f"  RSI: {r.rsi14:.1f} | ADX: {r.adx14:.1f} | Squeeze: {r.compression_pct}%\n"
+                f"  Close: {r.close} | VW-RS: {r.vw_rs_score} | Squeeze: {r.compression_pct}%\n"
+                f"  RSI: {r.rsi14:.1f} | ADX: {r.adx14:.1f}\n"
             )
         lines.append("")
 
@@ -584,7 +613,7 @@ def format_results_message(results: List[ScanResult]) -> str:
         lines.append(f"📊 *Tactical Tier (Weekly Setup Only)*: {len(tactical)}")
         for r in tactical:
             lines.append(
-                f"• *{r.symbol}* ({r.week_date}) [{r.sector}] — Close: {r.close} | RSI: {r.rsi14:.1f} | ADX: {r.adx14:.1f}"
+                f"• *{r.symbol}* ({r.week_date}) [{r.sector}] — Close: {r.close} | VW-RS: {r.vw_rs_score}"
             )
 
     return "\n".join(lines)
@@ -635,7 +664,7 @@ def main():
     args = parser.parse_args()
 
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
-    print(f"Scanning {len(symbols)} symbols with Monthly Multi-Timeframe Confluence...")
+    print(f"Scanning {len(symbols)} symbols with Monthly Multi-Timeframe Confluence & VW-RS...")
 
     all_results: List[ScanResult] = []
     for i, symbol in enumerate(symbols, 1):
