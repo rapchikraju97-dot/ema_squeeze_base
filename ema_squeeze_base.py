@@ -1,9 +1,10 @@
 """
 EMA Squeeze Base Scanner with Monthly Confluence & Volume-Weighted RS (RKScanBot)
 -----------------------------------------------------------------------
-Weekly-timeframe scan integrated with Monthly Macro Trend confirmation 
-(6M > 20M > 40M EMA alignment + Monthly RSI >= 60), Volume-Weighted RS, 
-and robust Telegram dispatch with strict character-safe chunking & Markdown fallback.
+Weekly-timeframe scan integrated with balanced Monthly Macro Trend confirmation 
+(6M > 20M > 40M EMA alignment + Monthly RSI 55-63 + Support Test), 
+Volume-Weighted RS, and robust Telegram dispatch with strict character-safe 
+chunking & Markdown fallback.
 """
 
 import argparse
@@ -23,13 +24,13 @@ from ta.trend import ADXIndicator
 # Config
 # ---------------------------------------------------------------------------
 
-NEAR_EMA_PCT = 0.03        # Close must be within 3% of the 10W or 20W EMA
+NEAR_EMA_PCT = 0.03        # Weekly close must be within 3% of the 10W or 20W EMA
 UPTREND_REQUIRED = True    # Require ema10 > ema20 > ema40 and close > ema40
 ADX_MIN = 20               # Weekly ADX(14) must be at least this
 
-MONTHLY_EMA_PROXIMITY = 0.03 # Monthly close within 3% of 6M EMA for confluence check
-MAX_CROSS_LOOKBACK = 8     # Max months ago the 6M/20M EMA monthly cross could have happened
-MONTHLY_RSI_MIN = 60       # Monthly RSI(14) must be >= 60 for high-conviction tier
+MONTHLY_EMA_PROXIMITY = 0.05 # Monthly close within 5% of 6M or 20M EMA support
+MONTHLY_RSI_MIN = 55       # Monthly RSI(14) minimum floor
+MONTHLY_RSI_MAX = 63       # Monthly RSI(14) maximum ceiling for flexibility
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -389,8 +390,8 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
 
 def compute_volume_weighted_rs(weekly_df: pd.DataFrame) -> float:
     """
-    Computes a Volume-Weighted Relative Strength score over the last 12 weeks.
-    Rewards weeks where the stock closes positive and volume exceeds its 10-week average.
+    Computes a clean Volume-Weighted RS score scaled strictly from 0 to 100.
+    Measures accumulation strength over the last 12 weeks.
     """
     if len(weekly_df) < 15:
         return 0.0
@@ -398,13 +399,20 @@ def compute_volume_weighted_rs(weekly_df: pd.DataFrame) -> float:
     df = weekly_df.copy()
     df["vol_sma10"] = df["volume"].rolling(window=10).mean()
     df["return"] = df["close"].pct_change()
-    df["vol_weight"] = df["volume"] / df["vol_sma10"].replace(0, 1)
     
     recent = df.iloc[-12:].copy()
-    recent["vw_score"] = recent["return"] * recent["vol_weight"]
+    positive_accumulation_weeks = 0.0
+    total_weeks = len(recent)
     
-    vwrs_value = recent["vw_score"].sum() * 100
-    return round(float(vwrs_value), 2)
+    for _, row in recent.iterrows():
+        if row["return"] > 0 and row["volume"] > row["vol_sma10"]:
+            vol_multiplier = min(row["volume"] / row["vol_sma10"], 2.0)
+            positive_accumulation_weeks += (0.5 * vol_multiplier) + 0.5
+        elif row["return"] > 0:
+            positive_accumulation_weeks += 0.5
+
+    score = (positive_accumulation_weeks / total_weeks) * 100
+    return round(min(max(score, 0.0), 100.0), 2)
 
 
 def check_monthly_confluence(daily: pd.DataFrame) -> bool:
@@ -425,27 +433,24 @@ def check_monthly_confluence(daily: pd.DataFrame) -> bool:
     monthly["ema40"] = monthly["close"].ewm(span=40, adjust=False).mean()
     
     monthly["rsi14"] = RSIIndicator(close=monthly["close"], window=14).rsi()
-    monthly["cross"] = monthly["ema6"] > monthly["ema20"]
-    monthly["cross_change"] = monthly["cross"].astype(int).diff()
-
     latest = monthly.iloc[-1]
     
-    # Macro Rules: 
-    # 1. Alignment check: 6M EMA > 20M EMA > 40M EMA
-    # 2. Close > 20M EMA
-    # 3. Monthly RSI(14) >= 60
+    # Balanced Macro Rules with Flexible RSI range (55 to 63):
+    # 1. Structural Stack: 6M EMA > 20M EMA > 40M EMA
+    # 2. Price comfortably above the long-term 40M baseline
+    # 3. Monthly RSI bounded between 55 and 63
     if not (latest["ema6"] > latest["ema20"] > latest["ema40"] and 
-            latest["close"] > latest["ema20"] and 
-            pd.notna(latest["rsi14"]) and latest["rsi14"] >= MONTHLY_RSI_MIN):
+            latest["close"] > latest["ema40"] and 
+            pd.notna(latest["rsi14"]) and 
+            MONTHLY_RSI_MIN <= latest["rsi14"] <= MONTHLY_RSI_MAX):
         return False
 
-    lookback_window = monthly.iloc[-MAX_CROSS_LOOKBACK:]
-    has_recent_cross = (lookback_window["cross_change"] == 1).any()
-
+    # Check if price is testing support near either the 6M or 20M EMA (within 5%)
     dist_ema6 = abs(latest["close"] - latest["ema6"]) / latest["close"]
-    is_testing_ema6 = dist_ema6 <= MONTHLY_EMA_PROXIMITY
+    dist_ema20 = abs(latest["close"] - latest["ema20"]) / latest["close"]
+    is_testing_support = (dist_ema6 <= MONTHLY_EMA_PROXIMITY) or (dist_ema20 <= MONTHLY_EMA_PROXIMITY)
 
-    return bool(has_recent_cross and is_testing_ema6)
+    return bool(is_testing_support)
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -637,7 +642,6 @@ def send_telegram_message(text: str):
         try:
             resp = requests.post(url, data=payload, timeout=10)
             
-            # Fallback to plain text if Telegram rejects markdown syntax (400 Bad Request)
             if resp.status_code == 400:
                 print(f"Markdown parse warning on chunk {i}. Retrying as plain text...")
                 payload.pop("parse_mode")
@@ -664,7 +668,7 @@ def main():
     args = parser.parse_args()
 
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
-    print(f"Scanning {len(symbols)} symbols with Monthly Multi-Timeframe Confluence & VW-RS...")
+    print(f"Scanning {len(symbols)} symbols with Monthly RSI (55-63) Confluence & VW-RS...")
 
     all_results: List[ScanResult] = []
     for i, symbol in enumerate(symbols, 1):
