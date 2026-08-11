@@ -1,8 +1,8 @@
 """
-EMA Squeeze Base Scanner
+EMA Squeeze Base Scanner with Monthly Confluence & Volume Dynamics (RKScanBot)
 -----------------------------------------------------------------------
 Weekly-timeframe scan integrated with Monthly Macro Trend confirmation 
-and robust Telegram dispatch with strict character-safe chunking & Markdown fallback.
+(6M > 20M > 40M EMA alignment) and robust Telegram dispatch.
 """
 
 import argparse
@@ -394,17 +394,22 @@ def check_monthly_confluence(daily: pd.DataFrame) -> bool:
         if monthly.index[-1].month == today.month and monthly.index[-1].year == today.year:
             monthly = monthly.iloc[:-1]
 
-    if len(monthly) < 25:
+    if len(monthly) < 45:
         return False
 
     monthly["ema6"] = monthly["close"].ewm(span=6, adjust=False).mean()
     monthly["ema20"] = monthly["close"].ewm(span=20, adjust=False).mean()
+    monthly["ema40"] = monthly["close"].ewm(span=40, adjust=False).mean()
+    
     monthly["cross"] = monthly["ema6"] > monthly["ema20"]
     monthly["cross_change"] = monthly["cross"].astype(int).diff()
 
     latest = monthly.iloc[-1]
     
-    if not (latest["ema6"] > latest["ema20"] and latest["close"] > latest["ema20"]):
+    # Macro Rules: 
+    # 1. Alignment check: 6M EMA > 20M EMA > 40M EMA
+    # 2. Close > 20M EMA
+    if not (latest["ema6"] > latest["ema20"] > latest["ema40"] and latest["close"] > latest["ema20"]):
         return False
 
     lookback_window = monthly.iloc[-MAX_CROSS_LOOKBACK:]
