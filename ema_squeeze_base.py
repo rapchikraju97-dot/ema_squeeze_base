@@ -70,8 +70,8 @@ SECTOR_BENCHMARK_MAP = {
     "Oil Gas & Consumable Fuels": "^CNXENERGY",
     "Realty": "^CNXREALTY",
 }
-RS_VS_MARKET_MIN = 0.0        # must be outperforming Nifty50 by at least this much (sweet-spot floor)
-RS_VS_MARKET_MAX = 25.0       # but not so far ahead it's likely overextended (sweet-spot ceiling)
+RS_VS_MARKET_MIN = -999.0     # temporarily wide open — not yet calibrated with real data (see below)
+RS_VS_MARKET_MAX = 999.0      # run --dry-run, read the "RS vs market DISTRIBUTION" block, then set real bounds
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -886,23 +886,29 @@ def main():
     # Annotate every match with RS vs market.
     # NOTE: this uses each symbol's CURRENT (latest week) return even in --backtest mode, so RS values
     # attached to older backtest weeks are only approximate context, not point-in-time-accurate.
+    all_market_rs_values: List[float] = []
     for r in all_results:
         sr = stock_return_map.get(r.symbol)
         if sr is not None and market_return is not None:
             r.rs_vs_market_pct = round(sr - market_return, 2)
+            all_market_rs_values.append(r.rs_vs_market_pct)
         if r.rs_vs_sector_pct is not None:
             all_vw_rs_values.append(r.rs_vs_sector_pct)
 
-    if all_vw_rs_values:
-        s = pd.Series(all_vw_rs_values)
+    def _print_distribution(label: str, values: List[float], const_names: str):
+        if not values:
+            print(f"\nNo {label} values computed this run — can't report a distribution yet.\n")
+            return
+        s = pd.Series(values)
         print("\n" + "=" * 60)
-        print(f"VW-RS DISTRIBUTION (from {len(all_vw_rs_values)} matched stocks this run)")
+        print(f"{label} DISTRIBUTION (from {len(values)} matched stocks this run)")
         print(f"  min={s.min():.2f}  p25={s.quantile(.25):.2f}  median={s.median():.2f}  "
               f"p75={s.quantile(.75):.2f}  p90={s.quantile(.90):.2f}  max={s.max():.2f}")
-        print("Use these numbers to set RS_VS_SECTOR_MIN/MAX, then set REQUIRE_RS_GATE = True.")
+        print(f"Use these numbers to set {const_names}.")
         print("=" * 60 + "\n")
-    else:
-        print("\nNo VW-RS values computed this run — can't report a distribution yet.\n")
+
+    _print_distribution("VW-RS (sector)", all_vw_rs_values, "RS_VS_SECTOR_MIN/MAX")
+    _print_distribution("RS vs market", all_market_rs_values, "RS_VS_MARKET_MIN/MAX")
 
     before_gate = len(all_results)
     if REQUIRE_RS_GATE:
