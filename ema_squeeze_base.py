@@ -8,8 +8,8 @@ Flags stocks where:
   2. Close is at/just above the 10W or 20W EMA (within 3%)
   3. Close is above the 40W EMA (broader uptrend intact)
   4. ADX(14) > 20
-  5. Monthly Macro Trend confirmation (6M > 20M > 40M EMA alignment + Monthly RSI 55-63 + Support Test)
-  6. RS Gate: Relative Strength vs Nifty 50 and Sector peers must be in the sweet-spot range (0% to 25%)
+  5. Monthly Macro Trend confirmation (6M > 20M > 40M EMA alignment + Monthly RSI 50-70 + Support Test) - Zero Look-Ahead Bias
+  6. True Volume-Weighted Relative Strength vs Nifty 50 benchmark (0% to 25% sweet-spot filter)
 
 Usage:
     python ema_squeeze_base.py                # live run, sends Telegram alert
@@ -46,16 +46,14 @@ UPTREND_REQUIRED = True    # Require ema10 > ema20 > ema40 and close > ema40
 ADX_MIN = 20               # Weekly ADX(14) must be at least this
 
 MONTHLY_EMA_PROXIMITY = 0.05   # Monthly close within 5% of 6M or 20M EMA support
-MONTHLY_RSI_MIN = 55         # Monthly RSI(14) minimum floor
-MONTHLY_RSI_MAX = 63         # Monthly RSI(14) maximum ceiling for flexibility
+MONTHLY_RSI_MIN = 50         # Monthly RSI(14) institutional minimum floor (secular bull zone)
+MONTHLY_RSI_MAX = 70         # Monthly RSI(14) maximum ceiling (avoids parabolic overbought extremes)
 
 RS_LOOKBACK_WEEKS = 12       # ~1 quarter for Relative Strength calculation
 MARKET_INDEX_TICKER = "^NSEI"# Nifty 50 benchmark ticker
 RS_VS_MARKET_MIN = 0.0       # RS vs Market floor (avoid weak/underperforming stocks)
 RS_VS_MARKET_MAX = 25.0      # RS vs Market ceiling (avoid overextended/parabolic stocks)
-RS_VS_SECTOR_MIN = 0.0       # RS vs Sector peer floor
-RS_VS_SECTOR_MAX = 25.0      # RS vs Sector peer ceiling
-REQUIRE_RS_GATE = True       # Enforce RS sweet-spot filtering gate
+REQUIRE_RS_GATE = True       # Enforce true relative strength sweet-spot filtering gate
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -327,7 +325,7 @@ SECTOR_MAP = {
     "TATACOMM": "Telecommunication", "TCS": "Information Technology", "TATACONSUM": "Fast Moving Consumer Goods", "TATAELXSI": "Information Technology",
     "TATAINVEST": "Financial Services", "TMCV": "Capital Goods", "TMPV": "Automobile and Auto Components", "TATAPOWER": "Power",
     "TATASTEEL": "Metals & Mining", "TATATECH": "Information Technology", "TTML": "Telecommunication", "TECHM": "Information Technology",
-    "TECHNOE": "Construction", "TEGA": "Capital Goods", "TEJASNET": "Telecommunication", "TENNIND": "Automobile and Auto Components",
+    "TECHNOE": "Construction", "TEGA": "Capital Goods", "TEJASNET": "Telecommunication", "TEJSS": "Automobile and Auto Components",
     "TEXRAIL": "Capital Goods", "THANGAMAYL": "Consumer Durables", "ANUP": "Capital Goods", "NIACL": "Financial Services",
     "RAMCOCEM": "Construction Materials", "THERMAX": "Capital Goods", "THOMASCOOK": "Consumer Services", "THYROCARE": "Healthcare",
     "TI": "Fast Moving Consumer Goods", "TIMETECHNO": "Capital Goods", "TIMKEN": "Capital Goods", "TIPSMUSIC": "Media Entertainment & Publication",
@@ -371,7 +369,7 @@ class ScanResult:
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data loading & Clean Index Helpers
 # ---------------------------------------------------------------------------
 
 def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
@@ -382,7 +380,6 @@ def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
             auto_adjust=True, timeout=15,
         )
     except Exception as e:
-        print(f"  [{symbol}] download error: {e}")
         return None
 
     if daily.empty:
@@ -415,34 +412,6 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
     return weekly
 
 
-def build_monthly_trend(daily: pd.DataFrame) -> pd.DataFrame:
-    monthly = daily.resample("ME").agg({"close": "last"}).dropna()
-    monthly["ema6_m"] = monthly["close"].ewm(span=6, adjust=False).mean()
-    monthly["ema20_m"] = monthly["close"].ewm(span=20, adjust=False).mean()
-    monthly["ema40_m"] = monthly["close"].ewm(span=40, adjust=False).mean()
-    
-    # Monthly RSI(14)
-    monthly["rsi14_m"] = RSIIndicator(close=monthly["close"], window=14).rsi()
-
-    # Balanced Macro Rules:
-    # 1. Structural Stack: 6M EMA > 20M EMA > 40M EMA
-    # 2. Price comfortably above long-term 40M baseline
-    # 3. Monthly RSI bounded between 55 and 63
-    monthly["rsi_ok"] = monthly["rsi14_m"].between(MONTHLY_RSI_MIN, MONTHLY_RSI_MAX)
-    monthly["stack_ok"] = (monthly["ema6_m"] > monthly["ema20_m"]) & (monthly["ema20_m"] > monthly["ema40_m"]) & (monthly["close"] > monthly["ema40_m"])
-    
-    monthly["monthly_uptrend"] = monthly["stack_ok"] & monthly["rsi_ok"]
-
-    # Check if price is testing support near either the 6M or 20M EMA (within 5%)
-    dist_ema6 = (monthly["close"] - monthly["ema6_m"]).abs() / monthly["close"]
-    dist_ema20 = (monthly["close"] - monthly["ema20_m"]).abs() / monthly["close"]
-    monthly["is_testing_support"] = (dist_ema6 <= MONTHLY_EMA_PROXIMITY) | (dist_ema20 <= MONTHLY_EMA_PROXIMITY)
-
-    monthly["monthly_confirmed"] = monthly["monthly_uptrend"] & monthly["is_testing_support"]
-
-    return monthly[["monthly_confirmed"]]
-
-
 def _clean_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     idx = pd.to_datetime(df.index)
     if idx.tz is not None:
@@ -452,24 +421,60 @@ def _clean_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def build_monthly_trend(daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes monthly trend and confluence rules once per symbol history.
+    Completely eliminates look-ahead bias and redundant per-row loops.
+    """
+    monthly = daily.resample("ME").agg({"close": "last"}).dropna()
+    if len(monthly) < 45:
+        return pd.DataFrame()
+
+    monthly["ema6"] = monthly["close"].ewm(span=6, adjust=False).mean()
+    monthly["ema20"] = monthly["close"].ewm(span=20, adjust=False).mean()
+    monthly["ema40"] = monthly["close"].ewm(span=40, adjust=False).mean()
+    
+    monthly["rsi14_m"] = RSIIndicator(close=monthly["close"], window=14).rsi()
+
+    # Broad Institutional Bull Rules: 6M > 20M > 40M EMA stack, price > 40M baseline, RSI in 50-70 band
+    stack_ok = (monthly["ema6"] > monthly["ema20"]) & (monthly["ema20"] > monthly["ema40"]) & (monthly["close"] > monthly["ema40"])
+    rsi_ok = monthly["rsi14_m"].between(MONTHLY_RSI_MIN, MONTHLY_RSI_MAX)
+    monthly["macro_valid"] = stack_ok & rsi_ok
+
+    # Support test near 6M or 20M EMA (within 5%)
+    dist_ema6 = (monthly["close"] - monthly["ema6"]).abs() / monthly["close"]
+    dist_ema20 = (monthly["close"] - monthly["ema20"]).abs() / monthly["close"]
+    is_testing_support = (dist_ema6 <= MONTHLY_EMA_PROXIMITY) | (dist_ema20 <= MONTHLY_EMA_PROXIMITY)
+
+    monthly["monthly_confirmed"] = monthly["macro_valid"] & is_testing_support
+    return monthly[["monthly_confirmed"]]
+
+
 def attach_monthly_trend(weekly: pd.DataFrame, monthly_trend: pd.DataFrame) -> pd.DataFrame:
-    weekly = _clean_datetime_index(weekly)
-    monthly_shifted = _clean_datetime_index(monthly_trend)
-    monthly_shifted.index = monthly_shifted.index + pd.Timedelta(days=1)
+    """
+    Safely attaches the most recently COMPLETED monthly confirmation status 
+    to each weekly bar using backward merge-asof (zero look-ahead bias).
+    """
+    if monthly_trend.empty:
+        weekly["monthly_confirmed"] = False
+        return weekly
+
+    w = _clean_datetime_index(weekly)
+    m = _clean_datetime_index(monthly_trend)
+    m.index = m.index + pd.Timedelta(days=1)  # Push to next day so merge_asof strictly sees completed months
 
     merged = pd.merge_asof(
-        weekly.sort_index(), monthly_shifted.sort_index(),
-        left_index=True, right_index=True, direction="backward",
+        w.sort_index(), m.sort_index(),
+        left_index=True, right_index=True, direction="backward"
     )
     merged["monthly_confirmed"] = merged["monthly_confirmed"].fillna(False)
     return merged
 
 
-def _fetch_index_weekly(ticker: str, period: str = "2y") -> Optional[pd.DataFrame]:
+def _fetch_index_weekly(ticker: str, period: str = "5y") -> Optional[pd.DataFrame]:
     try:
         daily = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True, timeout=15)
     except Exception as e:
-        print(f"  [{ticker}] index download error: {e}")
         return None
     if daily.empty:
         return None
@@ -484,14 +489,44 @@ def _fetch_index_weekly(ticker: str, period: str = "2y") -> Optional[pd.DataFram
     return weekly if len(weekly) > RS_LOOKBACK_WEEKS else None
 
 
-def compute_period_return(weekly_close: pd.Series, lookback: int = RS_LOOKBACK_WEEKS) -> Optional[float]:
-    if weekly_close is None or len(weekly_close) <= lookback:
+def compute_true_volume_weighted_rs(stock_weekly: pd.DataFrame, market_weekly: pd.DataFrame) -> Optional[float]:
+    """
+    Computes True Volume-Weighted Relative Strength: measures rate-of-change outperformance 
+    of the stock relative to Nifty 50, scaled by volume expansion over the last 12 weeks.
+    """
+    if stock_weekly is None or market_weekly is None:
         return None
-    now = weekly_close.iloc[-1]
-    then = weekly_close.iloc[-1 - lookback]
-    if pd.isna(now) or pd.isna(then) or then == 0:
+    if len(stock_weekly) < 15 or len(market_weekly) < 15:
         return None
-    return (now / then - 1) * 100
+
+    sw = _clean_datetime_index(stock_weekly)
+    mw = _clean_datetime_index(market_weekly)
+
+    combined = pd.DataFrame({
+        "stock_close": sw["close"],
+        "stock_vol": sw["volume"],
+        "market_close": mw["close"]
+    }).dropna()
+
+    if len(combined) < 15:
+        return None
+
+    # Ratio of stock to benchmark index
+    combined["ratio"] = combined["stock_close"] / combined["market_close"]
+    combined["ratio_return"] = combined["ratio"].pct_change()
+
+    # Volume expansion factor: stock volume vs its 10-week average
+    combined["vol_sma10"] = combined["stock_vol"].rolling(window=10).mean()
+    combined["vol_weight"] = combined["stock_vol"] / combined["vol_sma10"].replace(0, 1)
+
+    # Accumulate over lookback window
+    recent = combined.iloc[-RS_LOOKBACK_WEEKS:].copy()
+    if recent.empty:
+        return None
+
+    recent["vw_rs"] = recent["ratio_return"] * recent["vol_weight"]
+    score = recent["vw_rs"].sum() * 100
+    return round(float(score), 2)
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -581,7 +616,7 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     )
 
 
-def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int):
+def scan_symbol(symbol: str, market_weekly: Optional[pd.DataFrame], backtest: bool, lookback_weeks: int):
     daily = fetch_daily_ohlc(symbol)
     if daily is None:
         print(f"  [{symbol}] skipped — insufficient data")
@@ -597,7 +632,8 @@ def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int):
     weekly = compute_indicators(weekly)
     results = []
 
-    stock_return = compute_period_return(weekly["close"])
+    # Compute True Volume-Weighted RS vs Market Benchmark
+    vw_rs = compute_true_volume_weighted_rs(weekly, market_weekly)
 
     if backtest:
         start_idx = max(1, len(weekly) - lookback_weeks)
@@ -606,15 +642,17 @@ def scan_symbol(symbol: str, backtest: bool, lookback_weeks: int):
             if r:
                 r.symbol = symbol
                 r.sector = SECTOR_MAP.get(symbol)
+                r.rs_vs_market_pct = vw_rs
                 results.append(r)
     else:
         r = check_row(weekly, len(weekly) - 1)
         if r:
             r.symbol = symbol
             r.sector = SECTOR_MAP.get(symbol)
+            r.rs_vs_market_pct = vw_rs
             results.append(r)
 
-    return results, stock_return
+    return results, vw_rs
 
 
 # ---------------------------------------------------------------------------
@@ -682,8 +720,7 @@ def format_results_message(results: List[ScanResult]) -> str:
         dist_20 = abs(r.close - r.ema20) / r.close * 100
         rsi_txt = f"{r.rsi14:.1f}" if r.rsi14 is not None else "n/a"
         adx_txt = f"{r.adx14:.1f}" if r.adx14 is not None else "n/a"
-        rs_mkt = f"{r.rs_vs_market_pct:+.1f}%" if r.rs_vs_market_pct is not None else "n/a"
-        rs_sec = f"{r.rs_vs_sector_pct:+.1f}%" if r.rs_vs_sector_pct is not None else "n/a"
+        rs_mkt = f"{r.rs_vs_market_pct:+.1f}" if r.rs_vs_market_pct is not None else "n/a"
         sector_txt = f" [{r.sector}]" if r.sector else ""
         prefix = "⭐" if star else "•"
         return (
@@ -691,7 +728,7 @@ def format_results_message(results: List[ScanResult]) -> str:
             f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
             f"  Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
-            f"  RS vs Nifty50: {rs_mkt} | RS vs Sector: {rs_sec}\n"
+            f"  True VW-RS vs Nifty50: {rs_mkt}\n"
         )
 
     lines = [f"*Near 10W/20W EMA Scan* — {len(results)} match(es)\n"]
@@ -724,6 +761,7 @@ def explain_symbol(symbol: str):
         print(f"{symbol}: not enough weekly bars.")
         return
 
+    market_weekly = _fetch_index_weekly(MARKET_INDEX_TICKER)
     monthly_trend = build_monthly_trend(daily)
     weekly = attach_monthly_trend(weekly, monthly_trend)
     weekly = compute_indicators(weekly)
@@ -733,6 +771,7 @@ def explain_symbol(symbol: str):
         print(f"{symbol}: not enough history to evaluate yet.")
         return
 
+    vw_rs = compute_true_volume_weighted_rs(weekly, market_weekly)
     row = evald["row"]
     checks = evald["checks"]
     print(f"\n=== {symbol} — week of {row.name.date()} — close {row.close:.2f} ===")
@@ -743,6 +782,7 @@ def explain_symbol(symbol: str):
             all_pass = False
         print(f"  [{mark}] {name}: {detail}")
     print(f"  [INFO] monthly_confirmed: {evald['monthly_confirmed']}")
+    print(f"  [INFO] True VW-RS score: {vw_rs}")
     print(f"  => OVERALL: {'MATCH' if all_pass else 'no match'}\n")
 
 
@@ -764,50 +804,28 @@ def main():
     print(f"Scanning {len(symbols)} symbols...")
 
     market_weekly = _fetch_index_weekly(MARKET_INDEX_TICKER)
-    market_return = compute_period_return(market_weekly["close"]) if market_weekly is not None else None
-    if market_return is None:
-        print("Warning: could not fetch Nifty 50 benchmark — RS vs market will show as n/a.")
+    if market_weekly is None:
+        print("Warning: could not fetch Nifty 50 benchmark — RS gate will be bypassed.")
 
     all_results: List[ScanResult] = []
-    sector_returns: dict = {}
-    stock_return_map: dict = {}
 
     for i, symbol in enumerate(symbols, 1):
         print(f"[{i}/{len(symbols)}] {symbol}")
-        results, stock_return = scan_symbol(symbol, backtest=args.backtest, lookback_weeks=args.lookback_weeks)
+        results, _ = scan_symbol(symbol, market_weekly, backtest=args.backtest, lookback_weeks=args.lookback_weeks)
         all_results.extend(results)
-        if stock_return is not None:
-            stock_return_map[symbol] = stock_return
-            sector = SECTOR_MAP.get(symbol)
-            if sector:
-                sector_returns.setdefault(sector, []).append(stock_return)
         time.sleep(args.delay)
 
-    sector_median = {sec: float(pd.Series(rets).median()) for sec, rets in sector_returns.items()}
-
-    for r in all_results:
-        sr = stock_return_map.get(r.symbol)
-        if sr is None:
-            continue
-        if market_return is not None:
-            r.rs_vs_market_pct = round(sr - market_return, 2)
-        peers = sector_median.get(r.sector)
-        if peers is not None:
-            r.rs_vs_sector_pct = round(sr - peers, 2)
-
     before_gate = len(all_results)
-    if REQUIRE_RS_GATE:
+    if REQUIRE_RS_GATE and market_weekly is not None:
         def _in_sweet_spot(r: ScanResult) -> bool:
-            mkt_ok = (r.rs_vs_market_pct is None) or (RS_VS_MARKET_MIN <= r.rs_vs_market_pct <= RS_VS_MARKET_MAX)
-            sec_ok = (r.rs_vs_sector_pct is None) or (RS_VS_SECTOR_MIN <= r.rs_vs_sector_pct <= RS_VS_SECTOR_MAX)
-            return mkt_ok and sec_ok
+            if r.rs_vs_market_pct is None:
+                return True  # Don't drop due to data gaps
+            return RS_VS_MARKET_MIN <= r.rs_vs_market_pct <= RS_VS_MARKET_MAX
 
         all_results = [r for r in all_results if _in_sweet_spot(r)]
         dropped = before_gate - len(all_results)
         if dropped:
-            print(f"RS sweet-spot filter: dropped {dropped} match(es) outside "
-                  f"[{RS_VS_MARKET_MIN}%, {RS_VS_MARKET_MAX}%] vs market / "
-                  f"[{RS_VS_SECTOR_MIN}%, {RS_VS_SECTOR_MAX}%] vs sector.")
+            print(f"True VW-RS sweet-spot filter: dropped {dropped} match(es) outside [{RS_VS_MARKET_MIN}, {RS_VS_MARKET_MAX}].")
 
     print(f"\n{len(all_results)} match(es) found.")
     message = format_results_message(all_results)
