@@ -51,12 +51,12 @@ MONTHLY_RETEST_PCT = 0.05   # monthly close must be within 5% of the 6-month EMA
 RS_LOOKBACK_WEEKS = 12        # ~1 quarter, for RS vs market/sector
 MARKET_INDEX_TICKER = "NIFTYMIDSML400.NS"  # Nifty MidSmallcap 400 — matches RK's actual trading universe, not Nifty50
 FALLBACK_SECTOR_INDEX_TICKER = "NIFTYMIDSML400.NS"  # same universe fallback for sectors without a dedicated index
-REQUIRE_RS_GATE = True  # Calibrated from a real 82-match run: min=-28.4, p25=0.12, median=13.25,
-                          # p75=37.17, p90=69.25, max=240.61. Sweet spot = 0 to 70: drops the bottom
-                          # ~25% (weak/negative RS) and the top ~10% (long-tail outliers, likely a
-                          # single huge-volume week spiking the score rather than sustained strength).
+REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to NIFTYMIDSML400.NS.
+                          # Real run (18 matches): min=-29.22, p25=-5.87, median=4.26, p75=25.95,
+                          # p90=57.47, max=134.85. Sweet spot 0-60: drops negative/weak RS (~25%+,
+                          # since even p25 is negative) and the top long-tail outliers beyond p90.
 RS_VS_SECTOR_MIN = 0.0
-RS_VS_SECTOR_MAX = 70.0
+RS_VS_SECTOR_MAX = 60.0
 
 # Sector -> Yahoo Finance benchmark index ticker. Verified real tickers used where a dedicated
 # NSE sector index exists; everything else falls back to Nifty 500 (broad market, not one sector).
@@ -669,11 +669,24 @@ def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks:
 
     # Sector-index-based volume-weighted RS — fetched once per unique benchmark ticker and cached,
     # so 752 symbols across ~8 sector indices means ~8 extra fetches total, not 752.
+    # If a sector's dedicated index fails to fetch (Yahoo hiccup, delisted ticker, etc.), fall back
+    # to the broad-universe index rather than leaving every stock in that sector as "n/a" forever.
     sector = SECTOR_MAP.get(symbol)
     benchmark_ticker = SECTOR_BENCHMARK_MAP.get(sector, FALLBACK_SECTOR_INDEX_TICKER)
+
     if benchmark_ticker not in sector_cache:
         sector_cache[benchmark_ticker] = _fetch_index_weekly(benchmark_ticker, period="5y")
+        if sector_cache[benchmark_ticker] is None:
+            print(f"  Warning: benchmark '{benchmark_ticker}' (sector: {sector}) failed to fetch — "
+                  f"falling back to {FALLBACK_SECTOR_INDEX_TICKER} for this sector.")
+
     benchmark_weekly = sector_cache.get(benchmark_ticker)
+
+    if benchmark_weekly is None and benchmark_ticker != FALLBACK_SECTOR_INDEX_TICKER:
+        if FALLBACK_SECTOR_INDEX_TICKER not in sector_cache:
+            sector_cache[FALLBACK_SECTOR_INDEX_TICKER] = _fetch_index_weekly(FALLBACK_SECTOR_INDEX_TICKER, period="5y")
+        benchmark_weekly = sector_cache.get(FALLBACK_SECTOR_INDEX_TICKER)
+
     vw_rs = compute_volume_weighted_rs(weekly, benchmark_weekly)
 
     if backtest:
