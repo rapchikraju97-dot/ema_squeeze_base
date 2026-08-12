@@ -49,13 +49,14 @@ UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and clo
 ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out weak/no-trend stocks
 MONTHLY_RETEST_PCT = 0.05   # monthly close must be within 5% of the 6-month EMA to count as a "retest"
 RS_LOOKBACK_WEEKS = 12        # ~1 quarter, for RS vs market/sector
-MARKET_INDEX_TICKER = "^NSEI"  # Nifty 50, used as the market benchmark for RS
-FALLBACK_SECTOR_INDEX_TICKER = "^CRSLDX"  # Nifty 500 — broad fallback for sectors without a dedicated index
-REQUIRE_RS_GATE = False  # OFF for now — we don't know the VW-RS formula's real value range yet.
-                          # Run --dry-run, read the distribution summary it prints, THEN set
-                          # RS_VS_SECTOR_MIN/MAX from real numbers and flip this to True.
+MARKET_INDEX_TICKER = "NIFTYMIDSML400.NS"  # Nifty MidSmallcap 400 — matches RK's actual trading universe, not Nifty50
+FALLBACK_SECTOR_INDEX_TICKER = "NIFTYMIDSML400.NS"  # same universe fallback for sectors without a dedicated index
+REQUIRE_RS_GATE = True  # Calibrated from a real 82-match run: min=-28.4, p25=0.12, median=13.25,
+                          # p75=37.17, p90=69.25, max=240.61. Sweet spot = 0 to 70: drops the bottom
+                          # ~25% (weak/negative RS) and the top ~10% (long-tail outliers, likely a
+                          # single huge-volume week spiking the score rather than sustained strength).
 RS_VS_SECTOR_MIN = 0.0
-RS_VS_SECTOR_MAX = 25.0
+RS_VS_SECTOR_MAX = 70.0
 
 # Sector -> Yahoo Finance benchmark index ticker. Verified real tickers used where a dedicated
 # NSE sector index exists; everything else falls back to Nifty 500 (broad market, not one sector).
