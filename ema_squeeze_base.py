@@ -67,9 +67,14 @@ UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and clo
 ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out weak/no-trend stocks
 MONTHLY_RETEST_PCT = 0.05   # monthly close must be within 5% of the 6-month EMA to count as a "retest"
 RS_LOOKBACK_WEEKS = 12        # ~1 quarter, for RS vs market/sector
-MARKET_INDEX_TICKER = "NIFTYMIDSML400.NS"  # Nifty MidSmallcap 400 — matches RK's actual trading universe, not Nifty50
-MARKET_INDEX_LABEL = "Nifty MidSmallcap 400"  # used in messages/logs — keep in sync with MARKET_INDEX_TICKER
-FALLBACK_SECTOR_INDEX_TICKER = "NIFTYMIDSML400.NS"  # same universe fallback for sectors without a dedicated index
+# NIFTYMIDSML400.NS (no '^' prefix) was consistently unfetchable via yfinance in testing —
+# download(), retries, and the Ticker().history() fallback all failed while every '^'-prefixed
+# sector index worked fine. Switched to Nifty 500 (^CRSLDX), which uses the same convention as
+# the working sector benchmarks. Trade-off: broad market rather than mid/smallcap-specific, but
+# a working broad benchmark beats a broken precise one.
+MARKET_INDEX_TICKER = "^CRSLDX"
+MARKET_INDEX_LABEL = "Nifty 500"  # used in messages/logs — keep in sync with MARKET_INDEX_TICKER
+FALLBACK_SECTOR_INDEX_TICKER = "^CRSLDX"  # same broad-market fallback for sectors without a dedicated index
 
 # --- Retry / concurrency ---
 DOWNLOAD_RETRIES = 3
