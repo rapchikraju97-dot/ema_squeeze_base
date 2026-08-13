@@ -18,6 +18,19 @@ Usage:
         (checks the last N weeks per symbol instead of just the latest —
          use this first to validate against known winners like MTARTECH,
          CUMMINSIND, APARINDS before trusting it live)
+    python ema_squeeze_base.py --rs-debug --limit 100 --dry-run
+        (prints a reason for every stock where RS vs Sector comes back N/A)
+    python ema_squeeze_base.py --weekly-report
+        (skips scanning; reads match_history.csv, checks current price vs.
+         price-at-match for every logged match in the lookback window, and
+         sends a performance/journal digest to Telegram)
+
+    NOTE on GitHub Actions: match_history.csv is written to local disk, which
+    does NOT persist between Actions runs on its own. If running via Actions,
+    add a step after the scan that commits the file back to the repo, e.g.:
+        git config user.email "bot@rkscanbot" && git config user.name "RKScanBot"
+        git add match_history.csv && git commit -m "log matches" || true
+        git push
 
 Requirements:
     pip install yfinance pandas ta requests
@@ -28,10 +41,15 @@ Environment variables (for Telegram):
 """
 
 import argparse
+import csv
 import os
+import random
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional
 
 import pandas as pd
@@ -50,7 +68,22 @@ ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out w
 MONTHLY_RETEST_PCT = 0.05   # monthly close must be within 5% of the 6-month EMA to count as a "retest"
 RS_LOOKBACK_WEEKS = 12        # ~1 quarter, for RS vs market/sector
 MARKET_INDEX_TICKER = "NIFTYMIDSML400.NS"  # Nifty MidSmallcap 400 — matches RK's actual trading universe, not Nifty50
+MARKET_INDEX_LABEL = "Nifty MidSmallcap 400"  # used in messages/logs — keep in sync with MARKET_INDEX_TICKER
 FALLBACK_SECTOR_INDEX_TICKER = "NIFTYMIDSML400.NS"  # same universe fallback for sectors without a dedicated index
+
+# --- Retry / concurrency ---
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_BACKOFF_SECONDS = [1, 3, 8]   # sleep before retry attempt 1, 2, 3
+DEFAULT_WORKERS = 8                     # parallel symbol scans (I/O-bound, so threads not processes)
+DEFAULT_PER_REQUEST_DELAY = 0.3         # small per-worker delay to avoid hammering Yahoo simultaneously
+
+# --- Match history / weekly report ---
+MATCH_HISTORY_CSV = "match_history.csv"
+MATCH_HISTORY_FIELDS = [
+    "scan_run_date", "symbol", "sector", "week_date", "close_at_match",
+    "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed",
+]
+DEFAULT_REPORT_LOOKBACK_WEEKS = 8
 REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to NIFTYMIDSML400.NS.
                           # Real run (18 matches): min=-29.22, p25=-5.87, median=4.26, p75=25.95,
                           # p90=57.47, max=134.85. Sweet spot 0-60: drops negative/weak RS (~25%+,
@@ -103,7 +136,7 @@ SYMBOLS = [
     "CRAFTSMAN", "CREDITACC", "CRIZAC", "CROMPTON", "CUMMINSIND", "CUPID", "CYIENT", "DCBBANK",
     "DCMSHRIRAM", "DLF", "DOMS", "DABUR", "DALBHARAT", "DATAPATTNS", "DATAMATICS", "DEEPAKFERT",
     "DEEPAKNTR", "DELHIVERY", "DEVYANI", "DIACABS", "DBL", "DIVISLAB", "DIXON", "AGARWALEYE",
-    "LALPATHLAB", "DRREDDY", "DUMMYINXGN", "DUMMYTRVN", "DYNAMATECH", "EIDPARRY", "EIHOTEL", "EPL",
+    "LALPATHLAB", "DRREDDY", "DYNAMATECH", "EIDPARRY", "EIHOTEL", "EPL",
     "EDELWEISS", "EICHERMOT", "ELECON", "EMIL", "ELECTCAST", "ELGIEQUIP", "ELLEN", "EMAMILTD",
     "EMBDL", "EMCURE", "EMMVEE", "ENDURANCE", "ENGINERSIN", "ENTERO", "EIEL", "EQUITASBNK",
     "ERIS", "ESCORTS", "ETERNAL", "ETHOSLTD", "EUREKAFORB", "EXIDEIND", "NYKAA", "FEDFINA",
@@ -225,7 +258,7 @@ SECTOR_MAP = {
     "DALBHARAT": "Construction Materials", "DATAPATTNS": "Capital Goods", "DATAMATICS": "Information Technology", "DEEPAKFERT": "Chemicals",
     "DEEPAKNTR": "Chemicals", "DELHIVERY": "Services", "DEVYANI": "Consumer Services", "DIACABS": "Capital Goods",
     "DBL": "Construction", "DIVISLAB": "Healthcare", "DIXON": "Consumer Durables", "AGARWALEYE": "Healthcare",
-    "LALPATHLAB": "Healthcare", "DRREDDY": "Healthcare", "DUMMYINXGN": "Construction", "DUMMYTRVN": "Capital Goods",
+    "LALPATHLAB": "Healthcare", "DRREDDY": "Healthcare",
     "DYNAMATECH": "Capital Goods", "EIDPARRY": "Fast Moving Consumer Goods", "EIHOTEL": "Consumer Services", "EPL": "Capital Goods",
     "EDELWEISS": "Financial Services", "EICHERMOT": "Automobile and Auto Components", "ELECON": "Capital Goods", "EMIL": "Consumer Services",
     "ELECTCAST": "Capital Goods", "ELGIEQUIP": "Capital Goods", "ELLEN": "Chemicals", "EMAMILTD": "Fast Moving Consumer Goods",
@@ -392,18 +425,38 @@ class ScanResult:
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _download_with_retry(ticker: str, period: str, label: str) -> Optional[pd.DataFrame]:
+    """
+    Wraps yf.download with a few retries + backoff. Yahoo occasionally hiccups
+    (empty response, timeout, transient error) on a run scanning 750+ symbols —
+    previously any single failure permanently dropped that symbol/index for the
+    whole run. Now it gets DOWNLOAD_RETRIES attempts before giving up for real.
+    """
+    last_err = None
+    for attempt in range(DOWNLOAD_RETRIES):
+        try:
+            daily = yf.download(
+                ticker, period=period, interval="1d", progress=False,
+                auto_adjust=True, timeout=15,
+            )
+            if daily is not None and not daily.empty:
+                return daily
+            last_err = "empty response"
+        except Exception as e:
+            last_err = str(e)
+
+        if attempt < DOWNLOAD_RETRIES - 1:
+            sleep_for = DOWNLOAD_BACKOFF_SECONDS[min(attempt, len(DOWNLOAD_BACKOFF_SECONDS) - 1)]
+            time.sleep(sleep_for)
+
+    print(f"  [{label}] download failed after {DOWNLOAD_RETRIES} attempts: {last_err}")
+    return None
+
+
 def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
     ticker = f"{symbol}.NS"
-    try:
-        daily = yf.download(
-            ticker, period=period, interval="1d", progress=False,
-            auto_adjust=True, timeout=15,
-        )
-    except Exception as e:
-        print(f"  [{symbol}] download error: {e}")
-        return None
-
-    if daily.empty:
+    daily = _download_with_retry(ticker, period, label=symbol)
+    if daily is None:
         return None
 
     if isinstance(daily.columns, pd.MultiIndex):
@@ -411,6 +464,21 @@ def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
 
     daily.columns = [c.lower() for c in daily.columns]
     return daily
+
+
+def get_latest_close(symbol: str) -> Optional[float]:
+    """Cheap fetch of just the most recent daily close — used by the weekly
+    performance report so we don't have to pull 5y of history per symbol."""
+    ticker = f"{symbol}.NS"
+    daily = _download_with_retry(ticker, period="5d", label=symbol)
+    if daily is None:
+        return None
+    if isinstance(daily.columns, pd.MultiIndex):
+        daily.columns = daily.columns.get_level_values(0)
+    daily.columns = [c.lower() for c in daily.columns]
+    if "close" not in daily.columns or daily["close"].dropna().empty:
+        return None
+    return float(daily["close"].dropna().iloc[-1])
 
 
 def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -467,15 +535,9 @@ def attach_monthly_trend(weekly: pd.DataFrame, monthly_trend: pd.DataFrame) -> p
 
 
 def _fetch_index_weekly(ticker: str, period: str = "2y") -> Optional[pd.DataFrame]:
-    """Like fetch_daily_ohlc but for an index ticker that shouldn't get a .NS suffix.
-    NOTE: keeps close AND volume now (volume needed if this index is ever used as a stock-side
-    series; harmless extra column when used purely as a benchmark)."""
-    try:
-        daily = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True, timeout=15)
-    except Exception as e:
-        print(f"  [{ticker}] index download error: {e}")
-        return None
-    if daily.empty:
+    """Like fetch_daily_ohlc but for an index ticker that shouldn't get a .NS suffix."""
+    daily = _download_with_retry(ticker, period, label=ticker)
+    if daily is None:
         return None
     if isinstance(daily.columns, pd.MultiIndex):
         daily.columns = daily.columns.get_level_values(0)
@@ -648,8 +710,36 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     )
 
 
-def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks: int, rs_debug: bool = False):
-    """Returns (results, stock_return_pct_or_None)."""
+_sector_cache_lock = threading.Lock()  # guards sector_cache writes when scan_symbol runs across threads
+
+
+def prefetch_sector_benchmarks(symbols: List[str], sector_cache: dict):
+    """
+    Fetch every benchmark index needed by this symbol list ONCE, sequentially, before the
+    parallel per-symbol scan starts. There are only ~9 distinct benchmark tickers total
+    (8 sector indices + the fallback) regardless of how many stocks you scan, so this is
+    cheap — and it means scan_symbol never needs to write to sector_cache from multiple
+    threads at once in the common case.
+    """
+    needed = {SECTOR_BENCHMARK_MAP.get(SECTOR_MAP.get(s), FALLBACK_SECTOR_INDEX_TICKER) for s in symbols}
+    needed.add(FALLBACK_SECTOR_INDEX_TICKER)
+    for ticker in sorted(needed):
+        print(f"Prefetching benchmark: {ticker}")
+        fetched = _fetch_index_weekly(ticker, period="5y")
+        sector_cache[ticker] = fetched
+        if fetched is None:
+            print(f"  Warning: benchmark '{ticker}' failed to fetch — symbols using it will "
+                  f"fall back to {FALLBACK_SECTOR_INDEX_TICKER}.")
+
+
+def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks: int,
+                 rs_debug: bool = False, per_request_delay: float = 0.0):
+    """Returns (results, stock_return_pct_or_None). Safe to call from multiple threads
+    concurrently — sector_cache is expected to already be populated by
+    prefetch_sector_benchmarks(); any fallback writes here are lock-protected."""
+    if per_request_delay:
+        time.sleep(per_request_delay + random.uniform(0, per_request_delay))  # jitter avoids thundering herd
+
     daily = fetch_daily_ohlc(symbol)
     if daily is None:
         print(f"  [{symbol}] skipped — insufficient data")
@@ -670,22 +760,24 @@ def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks:
     sector = SECTOR_MAP.get(symbol)
     benchmark_ticker = SECTOR_BENCHMARK_MAP.get(sector, FALLBACK_SECTOR_INDEX_TICKER)
 
-    # CHANGED: a prior failed fetch used to be cached as a permanent None, so one transient
-    # Yahoo hiccup on a sector index (or the fallback) would blank out RS for every remaining
-    # stock in that sector for the rest of the run. Now a cached None triggers exactly one
-    # retry per benchmark ticker instead of being trusted forever.
+    # Normally already populated by prefetch_sector_benchmarks(). This is just a safety net
+    # (e.g. --explain on a single symbol, which skips the prefetch step) — lock-protected
+    # since scan_symbol can run concurrently across threads.
     if benchmark_ticker not in sector_cache or sector_cache[benchmark_ticker] is None:
-        fetched = _fetch_index_weekly(benchmark_ticker, period="5y")
-        sector_cache[benchmark_ticker] = fetched
-        if fetched is None:
-            print(f"  Warning: benchmark '{benchmark_ticker}' (sector: {sector}) failed to fetch — "
-                  f"will fall back to {FALLBACK_SECTOR_INDEX_TICKER} for this symbol.")
+        with _sector_cache_lock:
+            if benchmark_ticker not in sector_cache or sector_cache[benchmark_ticker] is None:
+                fetched = _fetch_index_weekly(benchmark_ticker, period="5y")
+                sector_cache[benchmark_ticker] = fetched
+                if fetched is None:
+                    print(f"  Warning: benchmark '{benchmark_ticker}' (sector: {sector}) failed to fetch — "
+                          f"will fall back to {FALLBACK_SECTOR_INDEX_TICKER} for this symbol.")
 
     benchmark_weekly = sector_cache.get(benchmark_ticker)
 
     if benchmark_weekly is None and benchmark_ticker != FALLBACK_SECTOR_INDEX_TICKER:
-        if FALLBACK_SECTOR_INDEX_TICKER not in sector_cache or sector_cache[FALLBACK_SECTOR_INDEX_TICKER] is None:
-            sector_cache[FALLBACK_SECTOR_INDEX_TICKER] = _fetch_index_weekly(FALLBACK_SECTOR_INDEX_TICKER, period="5y")
+        with _sector_cache_lock:
+            if FALLBACK_SECTOR_INDEX_TICKER not in sector_cache or sector_cache[FALLBACK_SECTOR_INDEX_TICKER] is None:
+                sector_cache[FALLBACK_SECTOR_INDEX_TICKER] = _fetch_index_weekly(FALLBACK_SECTOR_INDEX_TICKER, period="5y")
         benchmark_weekly = sector_cache.get(FALLBACK_SECTOR_INDEX_TICKER)
 
     vw_rs = compute_volume_weighted_rs(weekly, benchmark_weekly, symbol=symbol, verbose=rs_debug)
@@ -783,7 +875,7 @@ def format_results_message(results: List[ScanResult]) -> str:
             f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
             f"  Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
-            f"  RS vs Nifty50: {rs_mkt} | RS vs Sector: {rs_sec}\n"
+            f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
         )
 
     lines = [f"*Near 10W/20W EMA Scan* — {len(results)} match(es)\n"]
@@ -797,6 +889,127 @@ def format_results_message(results: List[ScanResult]) -> str:
         lines.append(f"📊 *Tactical (Weekly Setup Only)* — {len(tactical)}\n")
         for r in tactical:
             lines.append(_fmt_entry(r, star=False))
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Match history / weekly performance report
+# ---------------------------------------------------------------------------
+
+def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HISTORY_CSV):
+    """
+    Appends each match to a local CSV for later performance tracking. Dedupes on
+    (symbol, week_date) so re-running the same week's scan twice doesn't double-log.
+    NOTE: on GitHub Actions this file does not persist across runs unless your workflow
+    commits it back to the repo after the scan step — see the module docstring.
+    """
+    existing_keys = set()
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", newline="") as f:
+            for row in csv.DictReader(f):
+                existing_keys.add((row["symbol"], row["week_date"]))
+
+    new_rows = []
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    for r in results:
+        key = (r.symbol, r.week_date)
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        new_rows.append({
+            "scan_run_date": run_date,
+            "symbol": r.symbol,
+            "sector": r.sector or "",
+            "week_date": r.week_date,
+            "close_at_match": r.close,
+            "ema10_at_match": r.ema10,
+            "rs_vs_sector_at_match": r.rs_vs_sector_pct if r.rs_vs_sector_pct is not None else "",
+            "monthly_confirmed": r.monthly_confirmed,
+        })
+
+    if not new_rows:
+        return
+
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MATCH_HISTORY_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(new_rows)
+    print(f"Logged {len(new_rows)} new match(es) to {csv_path}.")
+
+
+def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
+                            csv_path: str = MATCH_HISTORY_CSV, workers: int = DEFAULT_WORKERS) -> str:
+    """
+    Reads match_history.csv, keeps matches from the last `lookback_weeks` calendar weeks,
+    fetches each unique symbol's current price once, and builds a Telegram-ready
+    performance/journal digest: return since match, win rate, best/worst.
+    """
+    if not os.path.exists(csv_path):
+        return f"*Weekly Performance Report*\nNo match history found at `{csv_path}` yet — nothing to report."
+
+    with open(csv_path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        return "*Weekly Performance Report*\nMatch history is empty — nothing to report."
+
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(weeks=lookback_weeks)
+    in_window = [r for r in rows if pd.to_datetime(r["week_date"]) >= cutoff]
+
+    if not in_window:
+        return f"*Weekly Performance Report*\nNo matches logged in the last {lookback_weeks} weeks."
+
+    unique_symbols = sorted({r["symbol"] for r in in_window})
+    print(f"Fetching current price for {len(unique_symbols)} symbol(s) for the weekly report...")
+
+    latest_prices = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_symbol = {executor.submit(get_latest_close, sym): sym for sym in unique_symbols}
+        for future in as_completed(future_to_symbol):
+            sym = future_to_symbol[future]
+            try:
+                latest_prices[sym] = future.result()
+            except Exception as e:
+                print(f"  [{sym}] latest-price fetch error: {e}")
+                latest_prices[sym] = None
+
+    enriched = []
+    for r in in_window:
+        current = latest_prices.get(r["symbol"])
+        entry = float(r["close_at_match"])
+        pct_return = round((current / entry - 1) * 100, 2) if current else None
+        weeks_held = round((pd.Timestamp.now().normalize() - pd.to_datetime(r["week_date"])).days / 7, 1)
+        enriched.append({**r, "current_price": current, "pct_return": pct_return, "weeks_held": weeks_held})
+
+    valid = [e for e in enriched if e["pct_return"] is not None]
+    no_price = [e for e in enriched if e["pct_return"] is None]
+    valid.sort(key=lambda e: e["pct_return"], reverse=True)
+
+    winners = [e for e in valid if e["pct_return"] > 0]
+    losers = [e for e in valid if e["pct_return"] <= 0]
+    win_rate = round(len(winners) / len(valid) * 100, 1) if valid else 0.0
+    avg_return = round(sum(e["pct_return"] for e in valid) / len(valid), 2) if valid else 0.0
+
+    lines = [
+        f"*Weekly Performance Report* — last {lookback_weeks} weeks\n",
+        f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | Avg return: {avg_return:+.2f}%\n",
+    ]
+
+    if valid:
+        lines.append("*Ranked by return:*")
+        for e in valid:
+            arrow = "🟢" if e["pct_return"] > 0 else "🔴"
+            lines.append(
+                f"{arrow} *{e['symbol']}* [{e['sector']}] — {e['pct_return']:+.2f}% "
+                f"({e['weeks_held']}w held, matched {e['week_date']} @ {e['close_at_match']} → now {e['current_price']:.2f})"
+            )
+
+    if no_price:
+        syms = ", ".join(e["symbol"] for e in no_price)
+        lines.append(f"\n_Could not fetch current price for: {syms}_")
 
     return "\n".join(lines)
 
@@ -852,41 +1065,74 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print results, skip Telegram send")
     parser.add_argument("--backtest", action="store_true", help="Check the last N weeks instead of just the latest")
     parser.add_argument("--lookback-weeks", type=int, default=5, help="Weeks to check when --backtest is set")
-    parser.add_argument("--delay", type=float, default=0.5, help="Seconds to sleep between symbol downloads")
+    parser.add_argument("--delay", type=float, default=DEFAULT_PER_REQUEST_DELAY,
+                         help="Base per-worker seconds to sleep before each symbol download (jitter added on top)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                         help="Number of symbols to scan in parallel (I/O-bound; keep modest to avoid Yahoo rate limits)")
     parser.add_argument("--limit", type=int, default=None, help="Only scan the first N symbols (useful for quick tests)")
     parser.add_argument("--explain", type=str, default=None,
                          help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
     parser.add_argument("--rs-debug", action="store_true",
                          help="Print a reason for every stock where RS vs Sector comes back N/A")
+    parser.add_argument("--no-log-history", action="store_true",
+                         help="Don't append this run's matches to match_history.csv")
+    parser.add_argument("--weekly-report", action="store_true",
+                         help="Skip scanning; send a performance/journal digest of past matches to Telegram instead")
+    parser.add_argument("--report-lookback-weeks", type=int, default=DEFAULT_REPORT_LOOKBACK_WEEKS,
+                         help="How many weeks of match history to include in --weekly-report")
     args = parser.parse_args()
 
     if args.explain:
         explain_symbol(args.explain.upper())
         return
 
+    if args.weekly_report:
+        message = generate_weekly_report(lookback_weeks=args.report_lookback_weeks, workers=args.workers)
+        print(message)
+        if not args.dry_run:
+            send_telegram_message(message)
+        return
+
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
-    print(f"Scanning {len(symbols)} symbols...")
+    print(f"Scanning {len(symbols)} symbols with {args.workers} parallel workers...")
 
     market_weekly = _fetch_index_weekly(MARKET_INDEX_TICKER)
     market_return = compute_period_return(market_weekly["close"]) if market_weekly is not None else None
     if market_return is None:
-        print("Warning: could not fetch Nifty 50 benchmark — RS vs market will show as n/a.")
+        print(f"Warning: could not fetch {MARKET_INDEX_LABEL} benchmark ({MARKET_INDEX_TICKER}) — "
+              f"RS vs market will show as n/a.")
 
     all_results: List[ScanResult] = []
     sector_cache: dict = {}
     stock_return_map: dict = {}
     all_vw_rs_values: List[float] = []
 
-    for i, symbol in enumerate(symbols, 1):
-        print(f"[{i}/{len(symbols)}] {symbol}")
-        results, stock_return = scan_symbol(
-            symbol, sector_cache, backtest=args.backtest,
-            lookback_weeks=args.lookback_weeks, rs_debug=args.rs_debug,
-        )
-        all_results.extend(results)
-        if stock_return is not None:
-            stock_return_map[symbol] = stock_return
-        time.sleep(args.delay)
+    # Fetch all needed sector/fallback benchmark indices ONCE, sequentially, up front —
+    # keeps the parallel stock scan below free of concurrent sector_cache writes.
+    prefetch_sector_benchmarks(symbols, sector_cache)
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_symbol = {
+            executor.submit(
+                scan_symbol, symbol, sector_cache, args.backtest, args.lookback_weeks,
+                args.rs_debug, args.delay,
+            ): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            completed += 1
+            try:
+                results, stock_return = future.result()
+            except Exception as e:
+                print(f"  [{symbol}] scan error: {e}")
+                continue
+            print(f"[{completed}/{len(symbols)}] {symbol}"
+                  + (f" — {len(results)} match(es)" if results else ""))
+            all_results.extend(results)
+            if stock_return is not None:
+                stock_return_map[symbol] = stock_return
 
     all_market_rs_values: List[float] = []
     for r in all_results:
@@ -934,6 +1180,12 @@ def main():
     print(f"\n{len(all_results)} match(es) found.")
     message = format_results_message(all_results)
     print(message)
+
+    # Log final (post-gate) matches for the weekly performance report — skipped for
+    # --backtest runs since those replay history rather than reflect a real live match,
+    # and would otherwise flood the log with dozens of past weeks per symbol.
+    if all_results and not args.backtest and not args.no_log_history:
+        log_matches_to_history(all_results)
 
     if not args.dry_run:
         send_telegram_message(message)
