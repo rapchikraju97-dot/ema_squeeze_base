@@ -89,12 +89,12 @@ MATCH_HISTORY_FIELDS = [
     "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed",
 ]
 DEFAULT_REPORT_LOOKBACK_WEEKS = 8
-REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to NIFTYMIDSML400.NS.
-                          # Real run (18 matches): min=-29.22, p25=-5.87, median=4.26, p75=25.95,
-                          # p90=57.47, max=134.85. Sweet spot 0-60: drops negative/weak RS (~25%+,
-                          # since even p25 is negative) and the top long-tail outliers beyond p90.
+REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to ^CRSLDX (Nifty 500).
+                          # Real run (99 matches): min=-23.72, p25=2.83, median=16.50, p75=39.64,
+                          # p90=75.65, max=240.61. Sweet spot 0-76: drops the small negative/weak-RS
+                          # tail below p25 and the top long-tail outliers beyond p90.
 RS_VS_SECTOR_MIN = 0.0
-RS_VS_SECTOR_MAX = 60.0
+RS_VS_SECTOR_MAX = 76.0
 
 # Sector -> Yahoo Finance benchmark index ticker. Verified real tickers used where a dedicated
 # NSE sector index exists; everything else falls back to Nifty 500 (broad market, not one sector).
@@ -112,8 +112,9 @@ SECTOR_BENCHMARK_MAP = {
     "Oil Gas & Consumable Fuels": "^CNXENERGY",
     "Realty": "^CNXREALTY",
 }
-RS_VS_MARKET_MIN = -999.0     # temporarily wide open — not yet calibrated with real data (see below)
-RS_VS_MARKET_MAX = 999.0      # run --dry-run, read the "RS vs market DISTRIBUTION" block, then set real bounds
+RS_VS_MARKET_MIN = 0.0        # Recalibrated (99 matches): min=-18.96, p25=-4.09, median=1.46,
+RS_VS_MARKET_MAX = 15.0       # p75=6.46, p90=14.54, max=36.34. Same sweet-spot logic: 0 floor drops
+                               # stocks lagging the market, ~p90 ceiling trims long-tail outliers.
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
