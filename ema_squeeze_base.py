@@ -94,7 +94,11 @@ RS_VS_SECTOR_MAX = 60.0
 # Sector -> Yahoo Finance benchmark index ticker. Verified real tickers used where a dedicated
 # NSE sector index exists; everything else falls back to Nifty 500 (broad market, not one sector).
 SECTOR_BENCHMARK_MAP = {
-    "Financial Services": "^CNXFIN",
+    "Financial Services": "NIFTY_FIN_SERVICE.NS",  # ^CNXFIN was silently repointed by Yahoo to a
+                                                     # different, narrower "NIFTY FINSRV25 50" index
+                                                     # and no longer returns usable history — this
+                                                     # is the correct current ticker for the broad
+                                                     # Nifty Financial Services index.
     "Automobile and Auto Components": "^CNXAUTO",
     "Fast Moving Consumer Goods": "^CNXFMCG",
     "Healthcare": "^CNXPHARMA",
@@ -427,10 +431,11 @@ class ScanResult:
 
 def _download_with_retry(ticker: str, period: str, label: str) -> Optional[pd.DataFrame]:
     """
-    Wraps yf.download with a few retries + backoff. Yahoo occasionally hiccups
-    (empty response, timeout, transient error) on a run scanning 750+ symbols —
-    previously any single failure permanently dropped that symbol/index for the
-    whole run. Now it gets DOWNLOAD_RETRIES attempts before giving up for real.
+    Wraps yf.download with retries + backoff, then falls back to the yf.Ticker().history()
+    API path if download() still comes back empty. These two paths hit Yahoo slightly
+    differently and have been known to diverge for certain tickers (particularly index
+    tickers) depending on yfinance version / session/cookie state — one succeeding where
+    the other returns empty isn't unusual.
     """
     last_err = None
     for attempt in range(DOWNLOAD_RETRIES):
@@ -441,15 +446,25 @@ def _download_with_retry(ticker: str, period: str, label: str) -> Optional[pd.Da
             )
             if daily is not None and not daily.empty:
                 return daily
-            last_err = "empty response"
+            last_err = "download() returned empty DataFrame"
         except Exception as e:
-            last_err = str(e)
+            last_err = f"download() raised: {e}"
 
         if attempt < DOWNLOAD_RETRIES - 1:
             sleep_for = DOWNLOAD_BACKOFF_SECONDS[min(attempt, len(DOWNLOAD_BACKOFF_SECONDS) - 1)]
             time.sleep(sleep_for)
 
-    print(f"  [{label}] download failed after {DOWNLOAD_RETRIES} attempts: {last_err}")
+    # Last resort: try the Ticker().history() path once before giving up entirely.
+    try:
+        hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True, timeout=15)
+        if hist is not None and not hist.empty:
+            print(f"  [{label}] download() failed but Ticker().history() succeeded — using that.")
+            return hist
+        last_err = f"{last_err} | Ticker().history() also returned empty"
+    except Exception as e:
+        last_err = f"{last_err} | Ticker().history() raised: {e}"
+
+    print(f"  [{label}] download failed after {DOWNLOAD_RETRIES} attempts + history() fallback: {last_err}")
     return None
 
 
