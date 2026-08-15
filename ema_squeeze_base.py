@@ -1014,10 +1014,21 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     win_rate = round(len(winners) / len(valid) * 100, 1) if valid else 0.0
     avg_return = round(sum(e["pct_return"] for e in valid) / len(valid), 2) if valid else 0.0
 
+    # Report the ACTUAL age spread of what's in this report, not just the search window —
+    # "last 8 weeks" describes how far back we looked, not how long these matches have been
+    # live. A report full of same-day matches (weeks_held ~0) has near-zero win-rate signal
+    # regardless of what the numbers show, so flag that explicitly instead of implying maturity.
+    max_age = max((e["weeks_held"] for e in enriched), default=0)
+    min_age = min((e["weeks_held"] for e in enriched), default=0)
+
     lines = [
-        f"*Weekly Performance Report* — last {lookback_weeks} weeks\n",
-        f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | Avg return: {avg_return:+.2f}%\n",
+        f"*Weekly Performance Report* — searched last {lookback_weeks} weeks of match history\n",
+        f"Matches span {min_age}–{max_age} week(s) old.\n",
     ]
+    if max_age < 1:
+        lines.append("⚠️ All matches are <1 week old — win rate/avg return below aren't meaningful yet, "
+                      "just noise from measuring too early. Check back after a few more weeks.\n")
+    lines.append(f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | Avg return: {avg_return:+.2f}%\n")
 
     if valid:
         lines.append("*Ranked by return:*")
@@ -1101,6 +1112,9 @@ def main():
                          help="Skip scanning; send a performance/journal digest of past matches to Telegram instead")
     parser.add_argument("--report-lookback-weeks", type=int, default=DEFAULT_REPORT_LOOKBACK_WEEKS,
                          help="How many weeks of match history to include in --weekly-report")
+    parser.add_argument("--with-weekly-report", action="store_true",
+                         help="After a normal scan, append the performance/journal digest to the SAME "
+                              "Telegram message instead of sending it separately")
     args = parser.parse_args()
 
     if args.explain:
@@ -1207,6 +1221,11 @@ def main():
     # and would otherwise flood the log with dozens of past weeks per symbol.
     if all_results and not args.backtest and not args.no_log_history:
         log_matches_to_history(all_results)
+
+    if args.with_weekly_report:
+        report = generate_weekly_report(lookback_weeks=args.report_lookback_weeks, workers=args.workers)
+        print("\n" + report)
+        message = message + "\n\n" + ("─" * 20) + "\n\n" + report
 
     if not args.dry_run:
         send_telegram_message(message)
