@@ -1030,18 +1030,29 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
                       "just noise from measuring too early. Check back after a few more weeks.\n")
     lines.append(f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | Avg return: {avg_return:+.2f}%\n")
 
-    if valid:
-        lines.append("*Ranked by return:*")
-        for e in valid:
-            arrow = "🟢" if e["pct_return"] > 0 else "🔴"
-            lines.append(
-                f"{arrow} *{e['symbol']}* [{e['sector']}] — {e['pct_return']:+.2f}% "
-                f"({e['weeks_held']}w held, matched {e['week_date']} @ {e['close_at_match']} → now {e['current_price']:.2f})"
-            )
+    def _fmt_stock_block(e: dict) -> str:
+        arrow = "🟢" if e["pct_return"] > 0 else "🔴"
+        held_txt = f"{e['weeks_held']} week(s)" if e["weeks_held"] >= 1 else "less than a week"
+        return (
+            f"{arrow} *{e['symbol']}* [{e['sector']}]\n"
+            f"   Scanned on: {e['week_date']}\n"
+            f"   Entry price: ₹{e['close_at_match']}\n"
+            f"   Current price: ₹{e['current_price']:.2f}\n"
+            f"   Move so far: {e['pct_return']:+.2f}% (held {held_txt})\n"
+        )
+
+    if winners:
+        lines.append(f"\n🟢 *Winners* ({len(winners)}):")
+        for e in winners:
+            lines.append(_fmt_stock_block(e))
+
+    if losers:
+        lines.append(f"🔴 *Losers / flat* ({len(losers)}):")
+        for e in losers:
+            lines.append(_fmt_stock_block(e))
 
     if no_price:
-        syms = ", ".join(e["symbol"] for e in no_price)
-        lines.append(f"\n_Could not fetch current price for: {syms}_")
+        lines.append(f"_Could not fetch current price for: {', '.join(e['symbol'] for e in no_price)}_")
 
     return "\n".join(lines)
 
