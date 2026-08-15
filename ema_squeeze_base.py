@@ -961,12 +961,15 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
     print(f"Logged {len(new_rows)} new match(es) to {csv_path}.")
 
 
+MIN_MATURITY_WEEKS = 1.0  # matches held less than this are excluded from all-time stats (too new to mean anything)
+
+
 def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
                             csv_path: str = MATCH_HISTORY_CSV, workers: int = DEFAULT_WORKERS) -> str:
     """
-    Reads match_history.csv, keeps matches from the last `lookback_weeks` calendar weeks,
-    fetches each unique symbol's current price once, and builds a Telegram-ready
-    performance/journal digest: return since match, win rate, best/worst.
+    Reads match_history.csv, builds the recent-window digest (last `lookback_weeks`) plus
+    an all-time cumulative track record (all matured matches, ever) so you have a running
+    scoreboard for whether the system actually has edge, not just a snapshot of this week.
     """
     if not os.path.exists(csv_path):
         return f"*Weekly Performance Report*\nNo match history found at `{csv_path}` yet — nothing to report."
@@ -977,13 +980,9 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     if not rows:
         return "*Weekly Performance Report*\nMatch history is empty — nothing to report."
 
-    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(weeks=lookback_weeks)
-    in_window = [r for r in rows if pd.to_datetime(r["week_date"]) >= cutoff]
-
-    if not in_window:
-        return f"*Weekly Performance Report*\nNo matches logged in the last {lookback_weeks} weeks."
-
-    unique_symbols = sorted({r["symbol"] for r in in_window})
+    # Fetch current price for EVERY symbol ever logged, once — powers both the recent-window
+    # section and the all-time scoreboard below, so we're not double-fetching.
+    unique_symbols = sorted({r["symbol"] for r in rows})
     print(f"Fetching current price for {len(unique_symbols)} symbol(s) for the weekly report...")
 
     latest_prices = {}
@@ -997,13 +996,44 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
                 print(f"  [{sym}] latest-price fetch error: {e}")
                 latest_prices[sym] = None
 
-    enriched = []
-    for r in in_window:
+    all_enriched = []
+    for r in rows:
         current = latest_prices.get(r["symbol"])
         entry = float(r["close_at_match"])
         pct_return = round((current / entry - 1) * 100, 2) if current else None
         weeks_held = round((pd.Timestamp.now().normalize() - pd.to_datetime(r["week_date"])).days / 7, 1)
-        enriched.append({**r, "current_price": current, "pct_return": pct_return, "weeks_held": weeks_held})
+        all_enriched.append({**r, "current_price": current, "pct_return": pct_return, "weeks_held": weeks_held})
+
+    # --- All-time scoreboard (matured matches only, across full history) ---
+    matured_all = [e for e in all_enriched if e["pct_return"] is not None and e["weeks_held"] >= MIN_MATURITY_WEEKS]
+    if matured_all:
+        atw_winners = [e for e in matured_all if e["pct_return"] > 0]
+        atw_win_rate = round(len(atw_winners) / len(matured_all) * 100, 1)
+        atw_returns = [e["pct_return"] for e in matured_all]
+        atw_avg_return = round(sum(atw_returns) / len(atw_returns), 2)
+        atw_median_return = round(pd.Series(atw_returns).median(), 2)
+        atw_best = max(matured_all, key=lambda e: e["pct_return"])
+        atw_worst = min(matured_all, key=lambda e: e["pct_return"])
+        scoreboard = (
+            f"\n📊 *All-Time Track Record* (matured matches, held ≥{MIN_MATURITY_WEEKS:g}w)\n"
+            f"   {len(matured_all)} matured match(es) since logging began\n"
+            f"   Win rate: {atw_win_rate}% | Avg return: {atw_avg_return:+.2f}% | Median: {atw_median_return:+.2f}%\n"
+            f"   Best: {atw_best['symbol']} {atw_best['pct_return']:+.2f}% | "
+            f"Worst: {atw_worst['symbol']} {atw_worst['pct_return']:+.2f}%\n"
+        )
+    else:
+        scoreboard = (
+            f"\n📊 *All-Time Track Record*\n"
+            f"   No matches have matured yet (need ≥{MIN_MATURITY_WEEKS:g} week held) — check back soon.\n"
+        )
+
+    # --- Recent-window section (unchanged behavior, just reuses the shared price fetch) ---
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(weeks=lookback_weeks)
+    enriched = [e for e in all_enriched if pd.to_datetime(e["week_date"]) >= cutoff]
+
+    if not enriched:
+        return (f"*Weekly Performance Report*\nNo matches logged in the last {lookback_weeks} weeks."
+                + scoreboard)
 
     valid = [e for e in enriched if e["pct_return"] is not None]
     no_price = [e for e in enriched if e["pct_return"] is None]
@@ -1013,6 +1043,7 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     losers = [e for e in valid if e["pct_return"] <= 0]
     win_rate = round(len(winners) / len(valid) * 100, 1) if valid else 0.0
     avg_return = round(sum(e["pct_return"] for e in valid) / len(valid), 2) if valid else 0.0
+    median_return = round(pd.Series([e["pct_return"] for e in valid]).median(), 2) if valid else 0.0
 
     # Report the ACTUAL age spread of what's in this report, not just the search window —
     # "last 8 weeks" describes how far back we looked, not how long these matches have been
@@ -1028,31 +1059,42 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     if max_age < 1:
         lines.append("⚠️ All matches are <1 week old — win rate/avg return below aren't meaningful yet, "
                       "just noise from measuring too early. Check back after a few more weeks.\n")
-    lines.append(f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | Avg return: {avg_return:+.2f}%\n")
+    lines.append(
+        f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | "
+        f"Avg return: {avg_return:+.2f}% | Median return: {median_return:+.2f}%\n"
+    )
+    if abs(avg_return - median_return) >= 5:
+        lines.append("_Avg and median diverge a lot — a few outliers are skewing the average; "
+                      "median is the more honest read here._\n")
 
     def _fmt_stock_block(e: dict) -> str:
         arrow = "🟢" if e["pct_return"] > 0 else "🔴"
-        held_txt = f"{e['weeks_held']} week(s)" if e["weeks_held"] >= 1 else "less than a week"
+        if e["weeks_held"] >= 1:
+            held_txt = f"held {e['weeks_held']} week(s)"
+        else:
+            held_txt = "held <1 week — still forming, don't read into this yet"
         return (
             f"{arrow} *{e['symbol']}* [{e['sector']}]\n"
             f"   Scanned on: {e['week_date']}\n"
             f"   Entry price: ₹{e['close_at_match']}\n"
             f"   Current price: ₹{e['current_price']:.2f}\n"
-            f"   Move so far: {e['pct_return']:+.2f}% (held {held_txt})\n"
+            f"   Move so far: {e['pct_return']:+.2f}% ({held_txt})\n"
         )
 
     if winners:
         lines.append(f"\n🟢 *Winners* ({len(winners)}):")
-        for e in winners:
+        for e in winners:  # already sorted best-first
             lines.append(_fmt_stock_block(e))
 
     if losers:
         lines.append(f"🔴 *Losers / flat* ({len(losers)}):")
-        for e in losers:
+        for e in sorted(losers, key=lambda e: e["pct_return"]):  # worst-first — the ones worth learning from
             lines.append(_fmt_stock_block(e))
 
     if no_price:
         lines.append(f"_Could not fetch current price for: {', '.join(e['symbol'] for e in no_price)}_")
+
+    lines.append(scoreboard)
 
     return "\n".join(lines)
 
