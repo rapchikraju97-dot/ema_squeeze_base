@@ -31,7 +31,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python ema_squeeze_base.py --gate-debug
+          python ema_squeeze_base.py --explain AEGISLOG
 
       - name: Commit match history
         run: |
