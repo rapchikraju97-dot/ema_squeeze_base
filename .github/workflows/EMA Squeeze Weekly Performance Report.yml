@@ -2,8 +2,9 @@ name: EMA Squeeze Weekly Performance Report
 
 on:
   schedule:
-    # Sunday, 19:00 IST = 13:30 UTC — after the week's price action is done
-    - cron: '30 13 * * 0'
+    # Friday, 19:00 IST = 13:30 UTC — 1 hour after the Friday scan (18:00 IST) so it has
+    # time to finish (scan has a 30-min timeout) before this report reads match_history.csv
+    - cron: '30 13 * * 5'
   workflow_dispatch: {}
 
 jobs:
