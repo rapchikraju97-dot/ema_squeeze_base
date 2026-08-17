@@ -65,6 +65,17 @@ from ta.trend import ADXIndicator
 NEAR_EMA_PCT = 0.03    # close must be within 3% of the 10W or 20W EMA — the ONLY proximity rule
 UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and close > ema40
 ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out weak/no-trend stocks
+MAX_PCT_OFF_52W_HIGH = 25.0  # Minervini Trend Template rule #7: close must be within this % of the
+                              # 52-week high. High_52w was already computed but never gated on —
+                              # this is the "is the stock actually strong" filter, distinct from
+                              # "is it currently paused near its EMAs."
+MIN_BASE_WEEKS = 8      # minimum consecutive weeks price has stayed near the 10W/20W EMA before this
+                         # counts as a real base, not a stock that just touched the EMA once. On a
+                         # weekly chart 8-15 weeks (~2-4 months) is the useful range — much less than
+                         # that is too thin to have shaken out weak hands.
+VOL_BASE_LOOKBACK_WEEKS = 6   # window used to judge volume contraction going into the current week
+HIGH_VOL_BREAKOUT_RATIO = 1.5  # current week's volume vs. base average, to flag a real breakout push
+TIGHT_COMPRESSION_PCT = 1.0    # compression_pct below this = "Very Tight"; used only for labeling
 MONTHLY_RETEST_PCT = 0.05   # monthly close must be within 5% of the 6-month EMA to count as a "retest"
 RS_LOOKBACK_WEEKS = 12        # ~1 quarter, for RS vs market/sector
 # NIFTYMIDSML400.NS (no '^' prefix) was consistently unfetchable via yfinance in testing —
@@ -429,6 +440,11 @@ class ScanResult:
     vol_ratio: Optional[float] = None
     vol_weighted_rs: Optional[float] = None
     monthly_confirmed: bool = False
+    dist_from_52w_high_pct: Optional[float] = None
+    base_weeks: Optional[int] = None
+    breakout_vol_ratio: Optional[float] = None   # this week's volume vs. base average
+    vol_contracting: Optional[bool] = None        # did volume shrink in the back half of the base
+    tightness_label: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +680,56 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # Scan logic
 # ---------------------------------------------------------------------------
 
+def _base_duration_weeks(df: pd.DataFrame, idx: int, near_pct: float = NEAR_EMA_PCT) -> int:
+    """
+    Counts consecutive weeks, walking backward from idx, where close stayed within near_pct of
+    the 10W or 20W EMA. This is the "how long has it actually been coiled" check that a single
+    near-EMA snapshot can't tell you — a stock that touched the EMA for the first time this week
+    and one that's been sitting there for 10 weeks look identical to the proximity check alone.
+    """
+    count = 0
+    i = idx
+    while i >= 0:
+        row = df.iloc[i]
+        if pd.isna(row.get("ema10")) or pd.isna(row.get("ema20")) or row.close == 0:
+            break
+        dist10 = abs(row.close - row.ema10) / row.close
+        dist20 = abs(row.close - row.ema20) / row.close
+        if dist10 <= near_pct or dist20 <= near_pct:
+            count += 1
+            i -= 1
+        else:
+            break
+    return count
+
+
+def _volume_profile(df: pd.DataFrame, idx: int, base_weeks: int):
+    """
+    Returns (breakout_vol_ratio, vol_contracting) for the current week vs. the base that
+    preceded it. breakout_vol_ratio: this week's volume vs. the base's average volume — a
+    number well above 1 signals real buying pressure behind the move, not a low-volume drift.
+    vol_contracting: whether volume shrank in the more recent half of the base vs. the earlier
+    half — genuine accumulation bases tend to go quiet before they break out; sustained high
+    volume through the whole base is more often distribution.
+    """
+    window = min(base_weeks, VOL_BASE_LOOKBACK_WEEKS)
+    if window < 2 or idx - window < 0:
+        return None, None
+
+    base_slice = df["volume"].iloc[idx - window: idx]  # excludes current (breakout) week
+    if base_slice.empty or base_slice.mean() == 0:
+        return None, None
+
+    breakout_vol_ratio = round(float(df["volume"].iloc[idx] / base_slice.mean()), 2)
+
+    half = max(1, window // 2)
+    earlier_half_avg = base_slice.iloc[:half].mean()
+    recent_half_avg = base_slice.iloc[half:].mean() if window > half else base_slice.iloc[:half].mean()
+    vol_contracting = bool(recent_half_avg < earlier_half_avg)
+
+    return breakout_vol_ratio, vol_contracting
+
+
 def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     if idx < 1 or idx >= len(df):
         return None
@@ -690,6 +756,23 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     monthly_retest = bool(pd.notna(monthly_dist) and monthly_dist <= MONTHLY_RETEST_PCT)
     monthly_confirmed = monthly_uptrend and monthly_retest
 
+    # --- 52-week-high gate (Minervini Trend Template #7) ---
+    high_52w = row.get("high_52w", float("nan"))
+    if pd.notna(high_52w) and high_52w > 0:
+        dist_from_52w_high_pct = round((high_52w - row.close) / high_52w * 100, 2)
+        near_52w_high_ok = dist_from_52w_high_pct <= MAX_PCT_OFF_52W_HIGH
+        pct_detail = f"{dist_from_52w_high_pct:.1f}% off 52W high (need <= {MAX_PCT_OFF_52W_HIGH:.0f}%)"
+    else:
+        # Not enough history yet (needs 52 weeks) — can't confirm strength, so this fails rather
+        # than passing by default. A recently-listed stock just doesn't qualify for this check yet.
+        dist_from_52w_high_pct = None
+        near_52w_high_ok = False
+        pct_detail = "52W high not available yet (needs 52 weeks of history)"
+
+    # --- Minimum base duration gate ---
+    base_weeks = _base_duration_weeks(df, idx)
+    base_duration_ok = base_weeks >= MIN_BASE_WEEKS
+
     checks = {
         "near_10w_or_20w_ema": (near_either,
             f"close {row.close:.2f} | dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to either)"),
@@ -697,8 +780,18 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
             f"ema10 {row.ema10:.2f} > ema20 {row.ema20:.2f} > ema40 {row.ema40:.2f}, close {row.close:.2f} > ema40: {uptrend_ok}"),
         "adx_min":            (adx_ok,
             f"ADX {adx_val:.1f} (need >= {ADX_MIN})" if pd.notna(adx_val) else "ADX not available"),
+        "near_52w_high":      (near_52w_high_ok, pct_detail),
+        "min_base_duration":  (base_duration_ok,
+            f"base held {base_weeks} week(s) (need >= {MIN_BASE_WEEKS})"),
     }
-    return {"row": row, "checks": checks, "monthly_confirmed": monthly_confirmed}
+
+    breakout_vol_ratio, vol_contracting = _volume_profile(df, idx, base_weeks)
+
+    return {
+        "row": row, "checks": checks, "monthly_confirmed": monthly_confirmed,
+        "dist_from_52w_high_pct": dist_from_52w_high_pct, "base_weeks": base_weeks,
+        "breakout_vol_ratio": breakout_vol_ratio, "vol_contracting": vol_contracting,
+    }
 
 
 def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
@@ -713,6 +806,9 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
 
     dist_ema10 = abs(row.close - row.ema10) / row.close
     dist_ema20 = abs(row.close - row.ema20) / row.close
+    compression_pct = round(min(dist_ema10, dist_ema20) * 100, 2)
+    tightness_label = "Very Tight" if compression_pct < TIGHT_COMPRESSION_PCT else \
+                       "Tight" if compression_pct < NEAR_EMA_PCT * 100 else "Moderate"
 
     return ScanResult(
         symbol="",
@@ -725,9 +821,14 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         adx14=round(row.adx14, 2) if pd.notna(row.get("adx14")) else None,
         pdi14=round(row.pdi14, 2) if pd.notna(row.get("pdi14")) else None,
         ndi14=round(row.ndi14, 2) if pd.notna(row.get("ndi14")) else None,
-        compression_pct=round(min(dist_ema10, dist_ema20) * 100, 2),
+        compression_pct=compression_pct,
         week_date=str(row.name.date()),
         monthly_confirmed=evald["monthly_confirmed"],
+        dist_from_52w_high_pct=evald["dist_from_52w_high_pct"],
+        base_weeks=evald["base_weeks"],
+        breakout_vol_ratio=evald["breakout_vol_ratio"],
+        vol_contracting=evald["vol_contracting"],
+        tightness_label=tightness_label,
     )
 
 
@@ -891,12 +992,31 @@ def format_results_message(results: List[ScanResult]) -> str:
         rs_sec = f"{r.rs_vs_sector_pct:+.1f}%" if r.rs_vs_sector_pct is not None else "n/a"
         sector_txt = f" [{r.sector}]" if r.sector else ""
         prefix = "⭐" if star else "•"
+
+        off_high_txt = f"{r.dist_from_52w_high_pct:.1f}% off 52W high" if r.dist_from_52w_high_pct is not None else "52W high n/a"
+        base_txt = f"{r.base_weeks}w base" if r.base_weeks is not None else "base n/a"
+        tightness_txt = r.tightness_label or "n/a"
+
+        vol_bits = []
+        if r.breakout_vol_ratio is not None:
+            if r.breakout_vol_ratio >= HIGH_VOL_BREAKOUT_RATIO:
+                vol_bits.append(f"🔊 {r.breakout_vol_ratio}x avg vol — real buying pressure")
+            else:
+                vol_bits.append(f"vol {r.breakout_vol_ratio}x avg")
+        if r.vol_contracting is True:
+            vol_bits.append("contracted into the base (healthy)")
+        elif r.vol_contracting is False:
+            vol_bits.append("⚠️ stayed elevated through the base (watch for distribution)")
+        vol_txt = " | ".join(vol_bits) if vol_bits else "vol profile n/a"
+
         return (
             f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}\n"
             f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
             f"  Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
             f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
+            f"  {off_high_txt} | {base_txt} ({tightness_txt})\n"
+            f"  {vol_txt}\n"
         )
 
     lines = [f"*Near 10W/20W EMA Scan* — {len(results)} match(es)\n"]
