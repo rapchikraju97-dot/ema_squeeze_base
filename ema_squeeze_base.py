@@ -81,8 +81,8 @@ SECTOR_BENCHMARK_MAP = {
     "Oil Gas & Consumable Fuels": "^CNXENERGY",
     "Realty": "^CNXREALTY",
 }
-RS_VS_MARKET_MIN = -15.0      # Recalibrated to accommodate current broad-market conditions (-15 floor)
-RS_VS_MARKET_MAX = 15.0       # p75=6.46, p90=14.54, max=36.34. Same sweet-spot logic: ~p90 ceiling trims long-tail outliers.
+RS_VS_MARKET_MIN = -25.0      # Expanded floor to accommodate broader market variance and individual pullbacks
+RS_VS_MARKET_MAX = 20.0       # Expanded ceiling to capture stronger upside relative strength outliers
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
