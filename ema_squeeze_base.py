@@ -1,45 +1,3 @@
-"""
-EMA Squeeze Base Scanner (symbols embedded — no external file needed)
------------------------------------------------------------------------
-Weekly-timeframe scan for RKScanBot.
-
-Flags stocks where:
-  1. 5W / 10W / 20W EMAs are compressed (tight spread) relative to price
-  2. Close is at/just above the 10W EMA (not below it)
-  3. Close is above the 40W EMA (broader uptrend intact)
-  4. RSI(14) is holding the 48-58 support band
-  5. ADX(14) > 20 and rising vs. the prior week
-  6. +DI(14) > -DI(14) (trend direction still bullish)
-
-Usage:
-    python ema_squeeze_base.py                # live run, sends Telegram alert
-    python ema_squeeze_base.py --dry-run       # prints results, no Telegram send
-    python ema_squeeze_base.py --backtest --lookback-weeks 20 --dry-run
-        (checks the last N weeks per symbol instead of just the latest —
-         use this first to validate against known winners like MTARTECH,
-         CUMMINSIND, APARINDS before trusting it live)
-    python ema_squeeze_base.py --rs-debug --limit 100 --dry-run
-        (prints a reason for every stock where RS vs Sector comes back N/A)
-    python ema_squeeze_base.py --weekly-report
-        (skips scanning; reads match_history.csv, checks current price vs.
-         price-at-match for every logged match in the lookback window, and
-         sends a performance/journal digest to Telegram)
-
-    NOTE on GitHub Actions: match_history.csv is written to local disk, which
-    does NOT persist between Actions runs on its own. If running via Actions,
-    add a step after the scan that commits the file back to the repo, e.g.:
-        git config user.email "bot@rkscanbot" && git config user.name "RKScanBot"
-        git add match_history.csv && git commit -m "log matches" || true
-        git push
-
-Requirements:
-    pip install yfinance pandas ta requests
-
-Environment variables (for Telegram):
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-"""
-
 import argparse
 import csv
 import os
@@ -66,13 +24,13 @@ NEAR_EMA_PCT = 0.03    # close must be within 3% of the 10W or 20W EMA — the O
 UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and close > ema40
 ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out weak/no-trend stocks
 MAX_PCT_OFF_52W_HIGH = 25.0  # Minervini Trend Template rule #7: close must be within this % of the
-                              # 52-week high. High_52w was already computed but never gated on —
-                              # this is the "is the stock actually strong" filter, distinct from
-                              # "is it currently paused near its EMAs."
-MIN_BASE_WEEKS = 8      # minimum consecutive weeks price has stayed near the 10W/20W EMA before this
-                         # counts as a real base, not a stock that just touched the EMA once. On a
-                         # weekly chart 8-15 weeks (~2-4 months) is the useful range — much less than
-                         # that is too thin to have shaken out weak hands.
+                            # 52-week high. High_52w was already computed but never gated on —
+                            # this is the "is the stock actually strong" filter, distinct from
+                            # "is it currently paused near its EMAs."
+MIN_BASE_WEEKS = 4      # minimum consecutive weeks price has stayed near the 10W/20W EMA before this
+                       # counts as a real base, not a stock that just touched the EMA once. On a
+                       # weekly chart 8-15 weeks (~2-4 months) is the useful range — much less than
+                       # that is too thin to have shaken out weak hands.
 VOL_BASE_LOOKBACK_WEEKS = 6   # window used to judge volume contraction going into the current week
 HIGH_VOL_BREAKOUT_RATIO = 1.5  # current week's volume vs. base average, to flag a real breakout push
 TIGHT_COMPRESSION_PCT = 1.0    # compression_pct below this = "Very Tight"; used only for labeling
@@ -101,9 +59,9 @@ MATCH_HISTORY_FIELDS = [
 ]
 DEFAULT_REPORT_LOOKBACK_WEEKS = 8
 REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to ^CRSLDX (Nifty 500).
-                          # Real run (99 matches): min=-23.72, p25=2.83, median=16.50, p75=39.64,
-                          # p90=75.65, max=240.61. Sweet spot 0-76: drops the small negative/weak-RS
-                          # tail below p25 and the top long-tail outliers beyond p90.
+                        # Real run (99 matches): min=-23.72, p25=2.83, median=16.50, p75=39.64,
+                        # p90=75.65, max=240.61. Sweet spot 0-76: drops the small negative/weak-RS
+                        # tail below p25 and the top long-tail outliers beyond p90.
 RS_VS_SECTOR_MIN = 0.0
 RS_VS_SECTOR_MAX = 76.0
 
@@ -111,10 +69,10 @@ RS_VS_SECTOR_MAX = 76.0
 # NSE sector index exists; everything else falls back to Nifty 500 (broad market, not one sector).
 SECTOR_BENCHMARK_MAP = {
     "Financial Services": "NIFTY_FIN_SERVICE.NS",  # ^CNXFIN was silently repointed by Yahoo to a
-                                                     # different, narrower "NIFTY FINSRV25 50" index
-                                                     # and no longer returns usable history — this
-                                                     # is the correct current ticker for the broad
-                                                     # Nifty Financial Services index.
+                                                    # different, narrower "NIFTY FINSRV25 50" index
+                                                    # and no longer returns usable history — this
+                                                    # is the correct current ticker for the broad
+                                                    # Nifty Financial Services index.
     "Automobile and Auto Components": "^CNXAUTO",
     "Fast Moving Consumer Goods": "^CNXFMCG",
     "Healthcare": "^CNXPHARMA",
@@ -123,9 +81,8 @@ SECTOR_BENCHMARK_MAP = {
     "Oil Gas & Consumable Fuels": "^CNXENERGY",
     "Realty": "^CNXREALTY",
 }
-RS_VS_MARKET_MIN = 0.0        # Recalibrated (99 matches): min=-18.96, p25=-4.09, median=1.46,
-RS_VS_MARKET_MAX = 15.0       # p75=6.46, p90=14.54, max=36.34. Same sweet-spot logic: 0 floor drops
-                               # stocks lagging the market, ~p90 ceiling trims long-tail outliers.
+RS_VS_MARKET_MIN = -15.0      # Recalibrated to accommodate current broad-market conditions (-15 floor)
+RS_VS_MARKET_MAX = 15.0       # p75=6.46, p90=14.54, max=36.34. Same sweet-spot logic: ~p90 ceiling trims long-tail outliers.
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -1112,7 +1069,7 @@ MIN_MATURITY_WEEKS = 1.0  # matches held less than this are excluded from all-ti
 
 
 def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
-                            csv_path: str = MATCH_HISTORY_CSV, workers: int = DEFAULT_WORKERS) -> str:
+                           csv_path: str = MATCH_HISTORY_CSV, workers: int = DEFAULT_WORKERS) -> str:
     """
     Reads match_history.csv, builds the recent-window digest (last `lookback_weeks`) plus
     an all-time cumulative track record (all matured matches, ever) so you have a running
@@ -1205,14 +1162,14 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     ]
     if max_age < 1:
         lines.append("⚠️ All matches are <1 week old — win rate/avg return below aren't meaningful yet, "
-                      "just noise from measuring too early. Check back after a few more weeks.\n")
+                     "just noise from measuring too early. Check back after a few more weeks.\n")
     lines.append(
         f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | "
         f"Avg return: {avg_return:+.2f}% | Median return: {median_return:+.2f}%\n"
     )
     if abs(avg_return - median_return) >= 5:
         lines.append("_Avg and median diverge a lot — a few outliers are skewing the average; "
-                      "median is the more honest read here._\n")
+                     "median is the more honest read here._\n")
 
     def _fmt_stock_block(e: dict) -> str:
         arrow = "🟢" if e["pct_return"] > 0 else "🔴"
@@ -1298,26 +1255,26 @@ def main():
     parser.add_argument("--backtest", action="store_true", help="Check the last N weeks instead of just the latest")
     parser.add_argument("--lookback-weeks", type=int, default=5, help="Weeks to check when --backtest is set")
     parser.add_argument("--delay", type=float, default=DEFAULT_PER_REQUEST_DELAY,
-                         help="Base per-worker seconds to sleep before each symbol download (jitter added on top)")
+                        help="Base per-worker seconds to sleep before each symbol download (jitter added on top)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                         help="Number of symbols to scan in parallel (I/O-bound; keep modest to avoid Yahoo rate limits)")
+                        help="Number of symbols to scan in parallel (I/O-bound; keep modest to avoid Yahoo rate limits)")
     parser.add_argument("--limit", type=int, default=None, help="Only scan the first N symbols (useful for quick tests)")
     parser.add_argument("--explain", type=str, default=None,
-                         help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
+                        help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
     parser.add_argument("--rs-debug", action="store_true",
-                         help="Print a reason for every stock where RS vs Sector comes back N/A")
+                        help="Print a reason for every stock where RS vs Sector comes back N/A")
     parser.add_argument("--gate-debug", action="store_true",
-                         help="Print a histogram of which condition (52W high, base duration, "
-                              "uptrend, ADX, EMA proximity) is rejecting the most stocks this run")
+                        help="Print a histogram of which condition (52W high, base duration, "
+                             "uptrend, ADX, EMA proximity) is rejecting the most stocks this run")
     parser.add_argument("--no-log-history", action="store_true",
-                         help="Don't append this run's matches to match_history.csv")
+                        help="Don't append this run's matches to match_history.csv")
     parser.add_argument("--weekly-report", action="store_true",
-                         help="Skip scanning; send a performance/journal digest of past matches to Telegram instead")
+                        help="Skip scanning; send a performance/journal digest of past matches to Telegram instead")
     parser.add_argument("--report-lookback-weeks", type=int, default=DEFAULT_REPORT_LOOKBACK_WEEKS,
-                         help="How many weeks of match history to include in --weekly-report")
+                        help="How many weeks of match history to include in --weekly-report")
     parser.add_argument("--with-weekly-report", action="store_true",
-                         help="After a normal scan, append the performance/journal digest to the SAME "
-                              "Telegram message instead of sending it separately")
+                        help="After a normal scan, append the performance/journal digest to the SAME "
+                             "Telegram message instead of sending it separately")
     args = parser.parse_args()
 
     if args.explain:
