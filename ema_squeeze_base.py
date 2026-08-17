@@ -794,16 +794,8 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     }
 
 
-def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
-    evald = evaluate_conditions(df, idx)
-    if evald is None:
-        return None
-
+def _build_scan_result(evald: dict) -> ScanResult:
     row = evald["row"]
-    checks = evald["checks"]
-    if not all(passed for passed, _ in checks.values()):
-        return None
-
     dist_ema10 = abs(row.close - row.ema10) / row.close
     dist_ema20 = abs(row.close - row.ema20) / row.close
     compression_pct = round(min(dist_ema10, dist_ema20) * 100, 2)
@@ -832,6 +824,30 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
     )
 
 
+def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
+    evald = evaluate_conditions(df, idx)
+    if evald is None:
+        return None
+    if not all(passed for passed, _ in evald["checks"].values()):
+        return None
+    return _build_scan_result(evald)
+
+
+def check_row_with_reasons(df: pd.DataFrame, idx: int):
+    """
+    Like check_row, but also returns the checks dict regardless of pass/fail — used to build
+    a gate-failure histogram (--gate-debug) so you can see WHICH condition is actually
+    rejecting most stocks instead of just getting a silent zero.
+    """
+    evald = evaluate_conditions(df, idx)
+    if evald is None:
+        return None, None
+    checks = evald["checks"]
+    if not all(passed for passed, _ in checks.values()):
+        return None, checks
+    return _build_scan_result(evald), checks
+
+
 _sector_cache_lock = threading.Lock()  # guards sector_cache writes when scan_symbol runs across threads
 
 
@@ -854,11 +870,16 @@ def prefetch_sector_benchmarks(symbols: List[str], sector_cache: dict):
                   f"fall back to {FALLBACK_SECTOR_INDEX_TICKER}.")
 
 
+_gate_counter_lock = threading.Lock()
+
+
 def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks: int,
-                 rs_debug: bool = False, per_request_delay: float = 0.0):
+                 rs_debug: bool = False, per_request_delay: float = 0.0, gate_counter: dict = None):
     """Returns (results, stock_return_pct_or_None). Safe to call from multiple threads
     concurrently — sector_cache is expected to already be populated by
-    prefetch_sector_benchmarks(); any fallback writes here are lock-protected."""
+    prefetch_sector_benchmarks(); any fallback writes here are lock-protected.
+    If gate_counter is passed (a plain dict), records which check(s) failed for symbols
+    that didn't match — powers --gate-debug's end-of-run histogram."""
     if per_request_delay:
         time.sleep(per_request_delay + random.uniform(0, per_request_delay))  # jitter avoids thundering herd
 
@@ -914,7 +935,13 @@ def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks:
                 r.rs_vs_sector_pct = vw_rs
                 results.append(r)
     else:
-        r = check_row(weekly, len(weekly) - 1)
+        r, checks = check_row_with_reasons(weekly, len(weekly) - 1)
+        if gate_counter is not None and checks is not None:
+            with _gate_counter_lock:
+                gate_counter["_total_scanned"] = gate_counter.get("_total_scanned", 0) + 1
+                for check_name, (passed, _) in checks.items():
+                    if not passed:
+                        gate_counter[check_name] = gate_counter.get(check_name, 0) + 1
         if r:
             r.symbol = symbol
             r.sector = sector
@@ -1279,6 +1306,9 @@ def main():
                          help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
     parser.add_argument("--rs-debug", action="store_true",
                          help="Print a reason for every stock where RS vs Sector comes back N/A")
+    parser.add_argument("--gate-debug", action="store_true",
+                         help="Print a histogram of which condition (52W high, base duration, "
+                              "uptrend, ADX, EMA proximity) is rejecting the most stocks this run")
     parser.add_argument("--no-log-history", action="store_true",
                          help="Don't append this run's matches to match_history.csv")
     parser.add_argument("--weekly-report", action="store_true",
@@ -1314,6 +1344,7 @@ def main():
     sector_cache: dict = {}
     stock_return_map: dict = {}
     all_vw_rs_values: List[float] = []
+    gate_counter: dict = {} if args.gate_debug else None
 
     # Fetch all needed sector/fallback benchmark indices ONCE, sequentially, up front —
     # keeps the parallel stock scan below free of concurrent sector_cache writes.
@@ -1324,7 +1355,7 @@ def main():
         future_to_symbol = {
             executor.submit(
                 scan_symbol, symbol, sector_cache, args.backtest, args.lookback_weeks,
-                args.rs_debug, args.delay,
+                args.rs_debug, args.delay, gate_counter,
             ): symbol
             for symbol in symbols
         }
@@ -1341,6 +1372,20 @@ def main():
             all_results.extend(results)
             if stock_return is not None:
                 stock_return_map[symbol] = stock_return
+
+    if gate_counter is not None:
+        total = gate_counter.pop("_total_scanned", 0)
+        print("\n" + "=" * 60)
+        print(f"GATE FAILURE HISTOGRAM (out of {total} symbols with enough data to evaluate)")
+        if total == 0:
+            print("  No symbols had enough data to evaluate — check the fetch logs above.")
+        else:
+            for check_name, fail_count in sorted(gate_counter.items(), key=lambda x: -x[1]):
+                pct = round(fail_count / total * 100, 1)
+                print(f"  {check_name}: failed for {fail_count}/{total} ({pct}%)")
+            print("\nThe check with the highest %% here is your current bottleneck — "
+                  "loosen that constant first, not the others, and re-run.")
+        print("=" * 60 + "\n")
 
     all_market_rs_values: List[float] = []
     for r in all_results:
