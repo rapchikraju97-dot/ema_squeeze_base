@@ -82,13 +82,13 @@ RS_VS_SECTOR_MAX = 76.0
 
 SECTOR_BENCHMARK_MAP = {
     "Financial Services": "NIFTY_FIN_SERVICE.NS",
-    "Automobile and Auto Components": "NIFTY_AUTO.NS",
-    "Fast Moving Consumer Goods": "NIFTY_FMCG.NS",
-    "Healthcare": "NIFTY_PHARMA.NS",
-    "Information Technology": "NIFTY_IT.NS",
-    "Metals & Mining": "NIFTY_METAL.NS",
-    "Oil Gas & Consumable Fuels": "NIFTY_ENERGY.NS",
-    "Realty": "NIFTY_REALTY.NS",
+    "Automobile and Auto Components": "^CNXAUTO",
+    "Fast Moving Consumer Goods": "^CNXFMCG",
+    "Healthcare": "^CNXPHARMA",
+    "Information Technology": "^CNXIT",
+    "Metals & Mining": "^CNXMETAL",
+    "Oil Gas & Consumable Fuels": "^CNXENERGY",
+    "Realty": "^CNXREALTY",
 }
 RS_VS_MARKET_MIN = -25.0
 RS_VS_MARKET_MAX = 20.0
