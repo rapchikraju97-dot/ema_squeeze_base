@@ -1,7 +1,8 @@
 """
 EMA Squeeze Base Scanner (symbols embedded — no external file needed)
 -----------------------------------------------------------------------
-Weekly-timeframe scan for RKScanBot with Automated Threat Detection.
+Weekly-timeframe scan for RKScanBot with Automated Threat Detection
+and Crisp Weekly Performance Reporting.
 
 Flags stocks where:
   1. 5W / 10W / 20W EMAs are compressed (tight spread) relative to price
@@ -1077,6 +1078,9 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
 
 def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
                            csv_path: str = MATCH_HISTORY_CSV, workers: int = DEFAULT_WORKERS) -> str:
+    """
+    Generates a crisp, punchy, and information-dense weekly performance digest.
+    """
     if not os.path.exists(csv_path):
         return f"*Weekly Performance Report*\nNo match history found at `{csv_path}` yet."
 
@@ -1112,13 +1116,36 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     if not valid:
         return f"*Weekly Performance Report*\nNo valid tracked returns in the last {lookback_weeks} weeks."
 
+    valid.sort(key=lambda x: x["pct_return"], reverse=True)
     win_rate = round(len([e for e in valid if e["pct_return"] > 0]) / len(valid) * 100, 1)
     avg_return = round(sum(e["pct_return"] for e in valid) / len(valid), 2)
+    median_return = round(pd.Series([e["pct_return"] for e in valid]).median(), 2)
 
-    return (
-        f"*Weekly Performance Report* ({len(valid)} matches tracked)\n"
-        f"Win rate: {win_rate}% | Avg return: {avg_return:+.2f}%"
-    )
+    winners = [e for e in valid if e["pct_return"] > 0]
+    losers = [e for e in valid if e["pct_return"] <= 0]
+    losers.sort(key=lambda x: x["pct_return"])  # worst first
+
+    top_winners = winners[:5]
+    top_losers = losers[:5]
+
+    lines = [
+        f"*Weekly Performance Digest* (searched last {lookback_weeks}w)\n",
+        f"📊 *Summary:* {len(valid)} matches tracked",
+        f"• *Win Rate:* {win_rate}% _({len(winners)} wins / {len(losers)} losses)_",
+        f"• *Avg Return:* {avg_return:+.2f}% | *Median:* {median_return:+.2f}%\n",
+        f"🚀 *Top Performers:*",
+    ]
+    for e in top_winners:
+        curr_str = f"₹{e['current_price']:.2f}" if e['current_price'] else "n/a"
+        lines.append(f"  • *{e['symbol']}* ({e.get('sector', 'N/A')}) — *{e['pct_return']:+.2f}%* (₹{e['close_at_match']} $\\rightarrow$ {curr_str})")
+
+    if top_losers:
+        lines.append(f"\n📉 *Notable Laggards:*")
+        for e in top_losers:
+            curr_str = f"₹{e['current_price']:.2f}" if e['current_price'] else "n/a"
+            lines.append(f"  • *{e['symbol']}* ({e.get('sector', 'N/A')}) — *{e['pct_return']:+.2f}%* (₹{e['close_at_match']} $\\rightarrow$ {curr_str})")
+
+    return "\n".join(lines)
 
 
 def explain_symbol(symbol: str):
@@ -1254,6 +1281,11 @@ def main():
 
     if all_results and not args.backtest and not args.no_log_history:
         log_matches_to_history(all_results)
+
+    if args.with_weekly_report:
+        report = generate_weekly_report(lookback_weeks=args.report_lookback_weeks, workers=args.workers)
+        print("\n" + report)
+        message = message + "\n\n" + ("─" * 20) + "\n\n" + report
 
     if not args.dry_run:
         send_telegram_message(message)
