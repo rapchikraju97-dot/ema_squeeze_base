@@ -98,7 +98,7 @@ DEFAULT_PER_REQUEST_DELAY = 0.3         # small per-worker delay to avoid hammer
 MATCH_HISTORY_CSV = "match_history.csv"
 MATCH_HISTORY_FIELDS = [
     "scan_run_date", "symbol", "sector", "week_date", "close_at_match",
-    "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed",
+    "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed", "buy_tag",
 ]
 DEFAULT_REPORT_LOOKBACK_WEEKS = 8
 REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to ^CRSLDX (Nifty 500).
@@ -450,6 +450,7 @@ class ScanResult:
     breakout_vol_ratio: Optional[float] = None   # this week's volume vs. base average
     vol_contracting: Optional[bool] = None        # did volume shrink in the back half of the base
     tightness_label: Optional[str] = None
+    buy_tag: bool = False   # strongest-conviction subset — see _build_scan_result for the exact rule
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +811,22 @@ def _build_scan_result(evald: dict) -> ScanResult:
     tightness_label = "Very Tight" if compression_pct < TIGHT_COMPRESSION_PCT else \
                        "Tight" if compression_pct < NEAR_EMA_PCT * 100 else "Moderate"
 
+    # BUY tag: the strictest-conviction subset among matches that already cleared all 5 gates.
+    # Every result here already passed 52W-high, base-duration, uptrend, ADX, and EMA proximity —
+    # this tag marks the ones that ALSO have monthly confirmation, a tight (not just "near") base,
+    # and a genuinely healthy volume signature (real breakout push + volume that contracted going
+    # into the base, not stayed elevated). This is a mechanical rule, not a recommendation — it
+    # reflects your own stated criteria, still needs your own chart/judgment before acting on it.
+    breakout_vol_ratio = evald["breakout_vol_ratio"]
+    vol_contracting = evald["vol_contracting"]
+    buy_tag = bool(
+        evald["monthly_confirmed"]
+        and tightness_label in ("Very Tight", "Tight")
+        and vol_contracting is True
+        and breakout_vol_ratio is not None
+        and breakout_vol_ratio >= HIGH_VOL_BREAKOUT_RATIO
+    )
+
     return ScanResult(
         symbol="",
         close=round(row.close, 2),
@@ -826,9 +843,10 @@ def _build_scan_result(evald: dict) -> ScanResult:
         monthly_confirmed=evald["monthly_confirmed"],
         dist_from_52w_high_pct=evald["dist_from_52w_high_pct"],
         base_weeks=evald["base_weeks"],
-        breakout_vol_ratio=evald["breakout_vol_ratio"],
-        vol_contracting=evald["vol_contracting"],
+        breakout_vol_ratio=breakout_vol_ratio,
+        vol_contracting=vol_contracting,
         tightness_label=tightness_label,
+        buy_tag=buy_tag,
     )
 
 
@@ -1013,10 +1031,7 @@ def send_telegram_message(text: str):
 
 def format_results_message(results: List[ScanResult]) -> str:
     if not results:
-        return "*Near 10W/20W EMA Scan*\nNo matches this week."
-
-    high_conviction = [r for r in results if r.monthly_confirmed]
-    tactical = [r for r in results if not r.monthly_confirmed]
+        return "*Near 5W/10W/20W EMA Scan*\nNo matches this week."
 
     def _fmt_entry(r: ScanResult, star: bool) -> str:
         dist_5 = abs(r.close - r.ema5) / r.close * 100
@@ -1046,7 +1061,7 @@ def format_results_message(results: List[ScanResult]) -> str:
         vol_txt = " | ".join(vol_bits) if vol_bits else "vol profile n/a"
 
         return (
-            f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}\n"
+            f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}{' ✅ *BUY SETUP*' if r.buy_tag else ''}\n"
             f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
             f"  Dist to EMA5: {dist_5:.2f}% | Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
@@ -1055,7 +1070,20 @@ def format_results_message(results: List[ScanResult]) -> str:
             f"  {vol_txt}\n"
         )
 
-    lines = [f"*Near 10W/20W EMA Scan* — {len(results)} match(es)\n"]
+    buy_setups = [r for r in results if r.buy_tag]
+    high_conviction = [r for r in results if r.monthly_confirmed and not r.buy_tag]
+    tactical = [r for r in results if not r.monthly_confirmed and not r.buy_tag]
+
+    lines = [f"*Near 5W/10W/20W EMA Scan* — {len(results)} match(es)\n"]
+
+    if buy_setups:
+        lines.append(
+            f"✅ *BUY SETUPS* — {len(buy_setups)}\n"
+            f"_(monthly-confirmed + tight base + healthy volume signature — still your call, "
+            f"not a recommendation)_\n"
+        )
+        for r in buy_setups:
+            lines.append(_fmt_entry(r, star=True))
 
     if high_conviction:
         lines.append(f"🔥 *High-Conviction (Weekly + Monthly Confluence)* — {len(high_conviction)}\n")
@@ -1074,6 +1102,33 @@ def format_results_message(results: List[ScanResult]) -> str:
 # Match history / weekly performance report
 # ---------------------------------------------------------------------------
 
+def _ensure_history_schema(csv_path: str = MATCH_HISTORY_CSV):
+    """
+    Migrates match_history.csv in place if it was written before a field (e.g. buy_tag) existed
+    in MATCH_HISTORY_FIELDS. Reads all existing rows, backfills any missing columns with an
+    empty value, and rewrites the file with the current header — old rows are preserved, they
+    just show blank for the new field(s) rather than breaking the CSV structure.
+    """
+    if not os.path.exists(csv_path):
+        return
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        current_fields = reader.fieldnames or []
+        rows = list(reader)
+
+    if current_fields == MATCH_HISTORY_FIELDS:
+        return  # already up to date
+
+    missing = [f for f in MATCH_HISTORY_FIELDS if f not in current_fields]
+    migrated = [{field: row.get(field, "") for field in MATCH_HISTORY_FIELDS} for row in rows]
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MATCH_HISTORY_FIELDS)
+        writer.writeheader()
+        writer.writerows(migrated)
+    print(f"Migrated {csv_path} schema — added column(s): {missing}")
+
+
 def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HISTORY_CSV):
     """
     Appends each match to a local CSV for later performance tracking. Dedupes on
@@ -1081,6 +1136,8 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
     NOTE: on GitHub Actions this file does not persist across runs unless your workflow
     commits it back to the repo after the scan step — see the module docstring.
     """
+    _ensure_history_schema(csv_path)
+
     existing_keys = set()
     if os.path.exists(csv_path):
         with open(csv_path, "r", newline="") as f:
@@ -1103,6 +1160,7 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
             "ema10_at_match": r.ema10,
             "rs_vs_sector_at_match": r.rs_vs_sector_pct if r.rs_vs_sector_pct is not None else "",
             "monthly_confirmed": r.monthly_confirmed,
+            "buy_tag": r.buy_tag,
         })
 
     if not new_rows:
@@ -1158,30 +1216,35 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
         entry = float(r["close_at_match"])
         pct_return = round((current / entry - 1) * 100, 2) if current else None
         weeks_held = round((pd.Timestamp.now().normalize() - pd.to_datetime(r["week_date"])).days / 7, 1)
-        all_enriched.append({**r, "current_price": current, "pct_return": pct_return, "weeks_held": weeks_held})
+        is_buy = str(r.get("buy_tag", "")).strip().lower() in ("true", "1")
+        all_enriched.append({**r, "current_price": current, "pct_return": pct_return,
+                              "weeks_held": weeks_held, "is_buy": is_buy})
 
-    # --- All-time scoreboard (matured matches only, across full history) ---
-    matured_all = [e for e in all_enriched if e["pct_return"] is not None and e["weeks_held"] >= MIN_MATURITY_WEEKS]
-    if matured_all:
-        atw_winners = [e for e in matured_all if e["pct_return"] > 0]
-        atw_win_rate = round(len(atw_winners) / len(matured_all) * 100, 1)
-        atw_returns = [e["pct_return"] for e in matured_all]
-        atw_avg_return = round(sum(atw_returns) / len(atw_returns), 2)
-        atw_median_return = round(pd.Series(atw_returns).median(), 2)
-        atw_best = max(matured_all, key=lambda e: e["pct_return"])
-        atw_worst = min(matured_all, key=lambda e: e["pct_return"])
-        scoreboard = (
-            f"\n📊 *All-Time Track Record* (matured matches, held ≥{MIN_MATURITY_WEEKS:g}w)\n"
-            f"   {len(matured_all)} matured match(es) since logging began\n"
-            f"   Win rate: {atw_win_rate}% | Avg return: {atw_avg_return:+.2f}% | Median: {atw_median_return:+.2f}%\n"
-            f"   Best: {atw_best['symbol']} {atw_best['pct_return']:+.2f}% | "
-            f"Worst: {atw_worst['symbol']} {atw_worst['pct_return']:+.2f}%\n"
+    def _scoreboard_for(subset: list, title: str) -> str:
+        matured = [e for e in subset if e["pct_return"] is not None and e["weeks_held"] >= MIN_MATURITY_WEEKS]
+        if not matured:
+            return f"\n{title}\n   No matches have matured yet (need ≥{MIN_MATURITY_WEEKS:g} week held).\n"
+        wins = [e for e in matured if e["pct_return"] > 0]
+        win_rate_ = round(len(wins) / len(matured) * 100, 1)
+        returns_ = [e["pct_return"] for e in matured]
+        avg_ = round(sum(returns_) / len(returns_), 2)
+        median_ = round(pd.Series(returns_).median(), 2)
+        best_ = max(matured, key=lambda e: e["pct_return"])
+        worst_ = min(matured, key=lambda e: e["pct_return"])
+        return (
+            f"\n{title}\n"
+            f"   {len(matured)} matured match(es)\n"
+            f"   Win rate: {win_rate_}% | Avg return: {avg_:+.2f}% | Median: {median_:+.2f}%\n"
+            f"   Best: {best_['symbol']} {best_['pct_return']:+.2f}% | "
+            f"Worst: {worst_['symbol']} {worst_['pct_return']:+.2f}%\n"
         )
-    else:
-        scoreboard = (
-            f"\n📊 *All-Time Track Record*\n"
-            f"   No matches have matured yet (need ≥{MIN_MATURITY_WEEKS:g} week held) — check back soon.\n"
-        )
+
+    # --- All-time scoreboards: overall AND buy-tag-only, side by side for comparison ---
+    buy_all = [e for e in all_enriched if e["is_buy"]]
+    scoreboard = (
+        _scoreboard_for(all_enriched, "📊 *All-Time Track Record* (all matches)")
+        + _scoreboard_for(buy_all, "✅ *All-Time Track Record — BUY SETUPS ONLY*")
+    )
 
     # --- Recent-window section (unchanged behavior, just reuses the shared price fetch) ---
     cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(weeks=lookback_weeks)
@@ -1195,11 +1258,17 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     no_price = [e for e in enriched if e["pct_return"] is None]
     valid.sort(key=lambda e: e["pct_return"], reverse=True)
 
-    winners = [e for e in valid if e["pct_return"] > 0]
-    losers = [e for e in valid if e["pct_return"] <= 0]
-    win_rate = round(len(winners) / len(valid) * 100, 1) if valid else 0.0
-    avg_return = round(sum(e["pct_return"] for e in valid) / len(valid), 2) if valid else 0.0
-    median_return = round(pd.Series([e["pct_return"] for e in valid]).median(), 2) if valid else 0.0
+    buy_valid = [e for e in valid if e["is_buy"]]
+    other_valid = [e for e in valid if not e["is_buy"]]
+
+    winners = [e for e in other_valid if e["pct_return"] > 0]
+    losers = [e for e in other_valid if e["pct_return"] <= 0]
+    win_rate = round(len(winners) / len(other_valid) * 100, 1) if other_valid else 0.0
+    avg_return = round(sum(e["pct_return"] for e in other_valid) / len(other_valid), 2) if other_valid else 0.0
+    median_return = round(pd.Series([e["pct_return"] for e in other_valid]).median(), 2) if other_valid else 0.0
+
+    buy_win_rate = round(len([e for e in buy_valid if e["pct_return"] > 0]) / len(buy_valid) * 100, 1) if buy_valid else 0.0
+    buy_avg_return = round(sum(e["pct_return"] for e in buy_valid) / len(buy_valid), 2) if buy_valid else 0.0
 
     # Report the ACTUAL age spread of what's in this report, not just the search window —
     # "last 8 weeks" describes how far back we looked, not how long these matches have been
@@ -1215,15 +1284,8 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     if max_age < 1:
         lines.append("⚠️ All matches are <1 week old — win rate/avg return below aren't meaningful yet, "
                       "just noise from measuring too early. Check back after a few more weeks.\n")
-    lines.append(
-        f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | "
-        f"Avg return: {avg_return:+.2f}% | Median return: {median_return:+.2f}%\n"
-    )
-    if abs(avg_return - median_return) >= 5:
-        lines.append("_Avg and median diverge a lot — a few outliers are skewing the average; "
-                      "median is the more honest read here._\n")
 
-    def _fmt_stock_block(e: dict) -> str:
+    def _fmt_stock_block(e: dict, label: str = "Scanned on") -> str:
         arrow = "🟢" if e["pct_return"] > 0 else "🔴"
         if e["weeks_held"] >= 1:
             held_txt = f"held {e['weeks_held']} week(s)"
@@ -1231,11 +1293,28 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
             held_txt = "held <1 week — still forming, don't read into this yet"
         return (
             f"{arrow} *{e['symbol']}* [{e['sector']}]\n"
-            f"   Scanned on: {e['week_date']}\n"
+            f"   {label}: {e['week_date']}\n"
             f"   Entry price: ₹{e['close_at_match']}\n"
             f"   Current price: ₹{e['current_price']:.2f}\n"
             f"   Move so far: {e['pct_return']:+.2f}% ({held_txt})\n"
         )
+
+    # --- Dedicated BUY SETUP tracking block — this is the accountability piece ---
+    if buy_valid:
+        lines.append(
+            f"✅ *BUY SETUP TRACKING* ({len(buy_valid)}) — "
+            f"Win rate: {buy_win_rate}% | Avg return: {buy_avg_return:+.2f}%\n"
+        )
+        for e in buy_valid:  # already sorted best-first
+            lines.append(_fmt_stock_block(e, label="Bought on"))
+
+    lines.append(
+        f"\n*Other matches:* {len(other_valid)} | Win rate: {win_rate}% | "
+        f"Avg return: {avg_return:+.2f}% | Median return: {median_return:+.2f}%\n"
+    )
+    if abs(avg_return - median_return) >= 5:
+        lines.append("_Avg and median diverge a lot — a few outliers are skewing the average; "
+                      "median is the more honest read here._\n")
 
     if winners:
         lines.append(f"\n🟢 *Winners* ({len(winners)}):")
