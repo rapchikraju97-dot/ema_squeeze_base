@@ -1,45 +1,3 @@
-"""
-EMA Squeeze Base Scanner (symbols embedded — no external file needed)
------------------------------------------------------------------------
-Weekly-timeframe scan for RKScanBot.
-
-Flags stocks where:
-  1. 5W / 10W / 20W EMAs are compressed (tight spread) relative to price
-  2. Close is at/just above the 10W EMA (not below it)
-  3. Close is above the 40W EMA (broader uptrend intact)
-  4. RSI(14) is holding the 48-58 support band
-  5. ADX(14) > 20 and rising vs. the prior week
-  6. +DI(14) > -DI(14) (trend direction still bullish)
-
-Usage:
-    python ema_squeeze_base.py                # live run, sends Telegram alert
-    python ema_squeeze_base.py --dry-run       # prints results, no Telegram send
-    python ema_squeeze_base.py --backtest --lookback-weeks 20 --dry-run
-        (checks the last N weeks per symbol instead of just the latest —
-         use this first to validate against known winners like MTARTECH,
-         CUMMINSIND, APARINDS before trusting it live)
-    python ema_squeeze_base.py --rs-debug --limit 100 --dry-run
-        (prints a reason for every stock where RS vs Sector comes back N/A)
-    python ema_squeeze_base.py --weekly-report
-        (skips scanning; reads match_history.csv, checks current price vs.
-         price-at-match for every logged match in the lookback window, and
-         sends a performance/journal digest to Telegram)
-
-    NOTE on GitHub Actions: match_history.csv is written to local disk, which
-    does NOT persist between Actions runs on its own. If running via Actions,
-    add a step after the scan that commits the file back to the repo, e.g.:
-        git config user.email "bot@rkscanbot" && git config user.name "RKScanBot"
-        git add match_history.csv && git commit -m "log matches" || true
-        git push
-
-Requirements:
-    pip install yfinance pandas ta requests
-
-Environment variables (for Telegram):
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-"""
-
 import argparse
 import csv
 import os
@@ -66,14 +24,13 @@ NEAR_EMA_PCT = 0.03    # close must be within 3% of the 10W or 20W EMA — the O
 UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and close > ema40
 ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out weak/no-trend stocks
 MAX_PCT_OFF_52W_HIGH = 25.0  # Minervini Trend Template rule #7: close must be within this % of the
-                              # 52-week high. High_52w was already computed but never gated on —
-                              # this is the "is the stock actually strong" filter, distinct from
-                              # "is it currently paused near its EMAs."
-MIN_BASE_WEEKS = 4      # loosened from 8 → 4 (2026-08-17): 8 weeks was rejecting ~most of the
-                         # universe (see the --gate-debug histogram from that run). 4 weeks
-                         # (~1 month) still requires a real pause, just not as demanding a one.
-                         # Revisit upward again once there's enough weekly-report data to tell
-                         # whether 4-week bases actually hold up as well as longer ones.
+                            # 52-week high. High_52w was already computed but never gated on —
+                            # this is the "is the stock actually strong" filter, distinct from
+                            # "is it currently paused near its EMAs."
+MIN_BASE_WEEKS = 4      # minimum consecutive weeks price has stayed near the 10W/20W EMA before this
+                       # counts as a real base, not a stock that just touched the EMA once. On a
+                       # weekly chart 8-15 weeks (~2-4 months) is the useful range — much less than
+                       # that is too thin to have shaken out weak hands.
 VOL_BASE_LOOKBACK_WEEKS = 6   # window used to judge volume contraction going into the current week
 HIGH_VOL_BREAKOUT_RATIO = 1.5  # current week's volume vs. base average, to flag a real breakout push
 TIGHT_COMPRESSION_PCT = 1.0    # compression_pct below this = "Very Tight"; used only for labeling
@@ -98,13 +55,13 @@ DEFAULT_PER_REQUEST_DELAY = 0.3         # small per-worker delay to avoid hammer
 MATCH_HISTORY_CSV = "match_history.csv"
 MATCH_HISTORY_FIELDS = [
     "scan_run_date", "symbol", "sector", "week_date", "close_at_match",
-    "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed", "buy_tag",
+    "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed",
 ]
 DEFAULT_REPORT_LOOKBACK_WEEKS = 8
 REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to ^CRSLDX (Nifty 500).
-                          # Real run (99 matches): min=-23.72, p25=2.83, median=16.50, p75=39.64,
-                          # p90=75.65, max=240.61. Sweet spot 0-76: drops the small negative/weak-RS
-                          # tail below p25 and the top long-tail outliers beyond p90.
+                        # Real run (99 matches): min=-23.72, p25=2.83, median=16.50, p75=39.64,
+                        # p90=75.65, max=240.61. Sweet spot 0-76: drops the small negative/weak-RS
+                        # tail below p25 and the top long-tail outliers beyond p90.
 RS_VS_SECTOR_MIN = 0.0
 RS_VS_SECTOR_MAX = 76.0
 
@@ -112,10 +69,10 @@ RS_VS_SECTOR_MAX = 76.0
 # NSE sector index exists; everything else falls back to Nifty 500 (broad market, not one sector).
 SECTOR_BENCHMARK_MAP = {
     "Financial Services": "NIFTY_FIN_SERVICE.NS",  # ^CNXFIN was silently repointed by Yahoo to a
-                                                     # different, narrower "NIFTY FINSRV25 50" index
-                                                     # and no longer returns usable history — this
-                                                     # is the correct current ticker for the broad
-                                                     # Nifty Financial Services index.
+                                                    # different, narrower "NIFTY FINSRV25 50" index
+                                                    # and no longer returns usable history — this
+                                                    # is the correct current ticker for the broad
+                                                    # Nifty Financial Services index.
     "Automobile and Auto Components": "^CNXAUTO",
     "Fast Moving Consumer Goods": "^CNXFMCG",
     "Healthcare": "^CNXPHARMA",
@@ -124,13 +81,8 @@ SECTOR_BENCHMARK_MAP = {
     "Oil Gas & Consumable Fuels": "^CNXENERGY",
     "Realty": "^CNXREALTY",
 }
-RS_VS_MARKET_MIN = -25.0      # Loosened (2026-08-17): the strict 0.0 floor combined with the new
-RS_VS_MARKET_MAX = 20.0       # 52W-high + base-duration gates was over-filtering to near zero
-                               # matches. This wider band still excludes the worst market laggards
-                               # (below -25%) and extreme outliers (above +20%) without requiring
-                               # every match to already be beating the market outright. Revisit with
-                               # a fresh --dry-run distribution once more weeks of data exist —
-                               # this was set to unblock matches, not from a calibrated distribution.
+RS_VS_MARKET_MIN = -15.0      # Recalibrated to accommodate current broad-market conditions (-15 floor)
+RS_VS_MARKET_MAX = 15.0       # p75=6.46, p90=14.54, max=36.34. Same sweet-spot logic: ~p90 ceiling trims long-tail outliers.
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -450,7 +402,6 @@ class ScanResult:
     breakout_vol_ratio: Optional[float] = None   # this week's volume vs. base average
     vol_contracting: Optional[bool] = None        # did volume shrink in the back half of the base
     tightness_label: Optional[str] = None
-    buy_tag: bool = False   # strongest-conviction subset — see _build_scan_result for the exact rule
 
 
 # ---------------------------------------------------------------------------
@@ -493,40 +444,6 @@ def _download_with_retry(ticker: str, period: str, label: str) -> Optional[pd.Da
         last_err = f"{last_err} | Ticker().history() raised: {e}"
 
     print(f"  [{label}] download failed after {DOWNLOAD_RETRIES} attempts + history() fallback: {last_err}")
-    return None
-
-
-def _download_with_retry_since(ticker: str, start_date, label: str) -> Optional[pd.DataFrame]:
-    """
-    Like _download_with_retry, but pulls from a specific start date forward instead of a fixed
-    period — used where we only need data since some known point (e.g. a match date), so we're
-    not re-downloading years of history just to check the last few weeks.
-    """
-    last_err = None
-    for attempt in range(DOWNLOAD_RETRIES):
-        try:
-            daily = yf.download(
-                ticker, start=start_date, interval="1d", progress=False,
-                auto_adjust=True, timeout=15,
-            )
-            if daily is not None and not daily.empty:
-                return daily
-            last_err = "download() returned empty DataFrame"
-        except Exception as e:
-            last_err = f"download() raised: {e}"
-
-        if attempt < DOWNLOAD_RETRIES - 1:
-            sleep_for = DOWNLOAD_BACKOFF_SECONDS[min(attempt, len(DOWNLOAD_BACKOFF_SECONDS) - 1)]
-            time.sleep(sleep_for)
-
-    try:
-        hist = yf.Ticker(ticker).history(start=start_date, interval="1d", auto_adjust=True, timeout=15)
-        if hist is not None and not hist.empty:
-            return hist
-    except Exception as e:
-        last_err = f"{last_err} | Ticker().history() raised: {e}"
-
-    print(f"  [{label}] since-fetch failed: {last_err}")
     return None
 
 
@@ -723,20 +640,19 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def _base_duration_weeks(df: pd.DataFrame, idx: int, near_pct: float = NEAR_EMA_PCT) -> int:
     """
     Counts consecutive weeks, walking backward from idx, where close stayed within near_pct of
-    the 5W, 10W, or 20W EMA. This is the "how long has it actually been coiled" check that a
-    single near-EMA snapshot can't tell you — a stock that touched the EMA for the first time
-    this week and one that's been sitting there for 10 weeks look identical to proximity alone.
+    the 10W or 20W EMA. This is the "how long has it actually been coiled" check that a single
+    near-EMA snapshot can't tell you — a stock that touched the EMA for the first time this week
+    and one that's been sitting there for 10 weeks look identical to the proximity check alone.
     """
     count = 0
     i = idx
     while i >= 0:
         row = df.iloc[i]
-        if pd.isna(row.get("ema5")) or pd.isna(row.get("ema10")) or pd.isna(row.get("ema20")) or row.close == 0:
+        if pd.isna(row.get("ema10")) or pd.isna(row.get("ema20")) or row.close == 0:
             break
-        dist5 = abs(row.close - row.ema5) / row.close
         dist10 = abs(row.close - row.ema10) / row.close
         dist20 = abs(row.close - row.ema20) / row.close
-        if dist5 <= near_pct or dist10 <= near_pct or dist20 <= near_pct:
+        if dist10 <= near_pct or dist20 <= near_pct:
             count += 1
             i -= 1
         else:
@@ -781,13 +697,11 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     if row[required].isna().any():
         return None
 
-    dist_ema5 = abs(row.close - row.ema5) / row.close
     dist_ema10 = abs(row.close - row.ema10) / row.close
     dist_ema20 = abs(row.close - row.ema20) / row.close
-    near_ema5 = dist_ema5 <= NEAR_EMA_PCT
     near_ema10 = dist_ema10 <= NEAR_EMA_PCT
     near_ema20 = dist_ema20 <= NEAR_EMA_PCT
-    near_any = near_ema5 or near_ema10 or near_ema20
+    near_either = near_ema10 or near_ema20
 
     uptrend_ok = bool(row.ema10 > row.ema20 > row.ema40 and row.close > row.ema40)
 
@@ -817,8 +731,8 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     base_duration_ok = base_weeks >= MIN_BASE_WEEKS
 
     checks = {
-        "near_5w_10w_or_20w_ema": (near_any,
-            f"close {row.close:.2f} | dist to EMA5 {dist_ema5*100:.2f}% | dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to any)"),
+        "near_10w_or_20w_ema": (near_either,
+            f"close {row.close:.2f} | dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to either)"),
         "uptrend":            (uptrend_ok if UPTREND_REQUIRED else True,
             f"ema10 {row.ema10:.2f} > ema20 {row.ema20:.2f} > ema40 {row.ema40:.2f}, close {row.close:.2f} > ema40: {uptrend_ok}"),
         "adx_min":            (adx_ok,
@@ -845,22 +759,6 @@ def _build_scan_result(evald: dict) -> ScanResult:
     tightness_label = "Very Tight" if compression_pct < TIGHT_COMPRESSION_PCT else \
                        "Tight" if compression_pct < NEAR_EMA_PCT * 100 else "Moderate"
 
-    # BUY tag: the strictest-conviction subset among matches that already cleared all 5 gates.
-    # Every result here already passed 52W-high, base-duration, uptrend, ADX, and EMA proximity —
-    # this tag marks the ones that ALSO have monthly confirmation, a tight (not just "near") base,
-    # and a genuinely healthy volume signature (real breakout push + volume that contracted going
-    # into the base, not stayed elevated). This is a mechanical rule, not a recommendation — it
-    # reflects your own stated criteria, still needs your own chart/judgment before acting on it.
-    breakout_vol_ratio = evald["breakout_vol_ratio"]
-    vol_contracting = evald["vol_contracting"]
-    buy_tag = bool(
-        evald["monthly_confirmed"]
-        and tightness_label in ("Very Tight", "Tight")
-        and vol_contracting is True
-        and breakout_vol_ratio is not None
-        and breakout_vol_ratio >= HIGH_VOL_BREAKOUT_RATIO
-    )
-
     return ScanResult(
         symbol="",
         close=round(row.close, 2),
@@ -877,10 +775,9 @@ def _build_scan_result(evald: dict) -> ScanResult:
         monthly_confirmed=evald["monthly_confirmed"],
         dist_from_52w_high_pct=evald["dist_from_52w_high_pct"],
         base_weeks=evald["base_weeks"],
-        breakout_vol_ratio=breakout_vol_ratio,
-        vol_contracting=vol_contracting,
+        breakout_vol_ratio=evald["breakout_vol_ratio"],
+        vol_contracting=evald["vol_contracting"],
         tightness_label=tightness_label,
-        buy_tag=buy_tag,
     )
 
 
@@ -1065,10 +962,12 @@ def send_telegram_message(text: str):
 
 def format_results_message(results: List[ScanResult]) -> str:
     if not results:
-        return "*Near 5W/10W/20W EMA Scan*\nNo matches this week."
+        return "*Near 10W/20W EMA Scan*\nNo matches this week."
+
+    high_conviction = [r for r in results if r.monthly_confirmed]
+    tactical = [r for r in results if not r.monthly_confirmed]
 
     def _fmt_entry(r: ScanResult, star: bool) -> str:
-        dist_5 = abs(r.close - r.ema5) / r.close * 100
         dist_10 = abs(r.close - r.ema10) / r.close * 100
         dist_20 = abs(r.close - r.ema20) / r.close * 100
         rsi_txt = f"{r.rsi14:.1f}" if r.rsi14 is not None else "n/a"
@@ -1095,29 +994,16 @@ def format_results_message(results: List[ScanResult]) -> str:
         vol_txt = " | ".join(vol_bits) if vol_bits else "vol profile n/a"
 
         return (
-            f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}{' ✅ *BUY SETUP*' if r.buy_tag else ''}\n"
-            f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
-            f"  Dist to EMA5: {dist_5:.2f}% | Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
+            f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}\n"
+            f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
+            f"  Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
             f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
             f"  {off_high_txt} | {base_txt} ({tightness_txt})\n"
             f"  {vol_txt}\n"
         )
 
-    buy_setups = [r for r in results if r.buy_tag]
-    high_conviction = [r for r in results if r.monthly_confirmed and not r.buy_tag]
-    tactical = [r for r in results if not r.monthly_confirmed and not r.buy_tag]
-
-    lines = [f"*Near 5W/10W/20W EMA Scan* — {len(results)} match(es)\n"]
-
-    if buy_setups:
-        lines.append(
-            f"✅ *BUY SETUPS* — {len(buy_setups)}\n"
-            f"_(monthly-confirmed + tight base + healthy volume signature — still your call, "
-            f"not a recommendation)_\n"
-        )
-        for r in buy_setups:
-            lines.append(_fmt_entry(r, star=True))
+    lines = [f"*Near 10W/20W EMA Scan* — {len(results)} match(es)\n"]
 
     if high_conviction:
         lines.append(f"🔥 *High-Conviction (Weekly + Monthly Confluence)* — {len(high_conviction)}\n")
@@ -1136,33 +1022,6 @@ def format_results_message(results: List[ScanResult]) -> str:
 # Match history / weekly performance report
 # ---------------------------------------------------------------------------
 
-def _ensure_history_schema(csv_path: str = MATCH_HISTORY_CSV):
-    """
-    Migrates match_history.csv in place if it was written before a field (e.g. buy_tag) existed
-    in MATCH_HISTORY_FIELDS. Reads all existing rows, backfills any missing columns with an
-    empty value, and rewrites the file with the current header — old rows are preserved, they
-    just show blank for the new field(s) rather than breaking the CSV structure.
-    """
-    if not os.path.exists(csv_path):
-        return
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        current_fields = reader.fieldnames or []
-        rows = list(reader)
-
-    if current_fields == MATCH_HISTORY_FIELDS:
-        return  # already up to date
-
-    missing = [f for f in MATCH_HISTORY_FIELDS if f not in current_fields]
-    migrated = [{field: row.get(field, "") for field in MATCH_HISTORY_FIELDS} for row in rows]
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=MATCH_HISTORY_FIELDS)
-        writer.writeheader()
-        writer.writerows(migrated)
-    print(f"Migrated {csv_path} schema — added column(s): {missing}")
-
-
 def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HISTORY_CSV):
     """
     Appends each match to a local CSV for later performance tracking. Dedupes on
@@ -1170,8 +1029,6 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
     NOTE: on GitHub Actions this file does not persist across runs unless your workflow
     commits it back to the repo after the scan step — see the module docstring.
     """
-    _ensure_history_schema(csv_path)
-
     existing_keys = set()
     if os.path.exists(csv_path):
         with open(csv_path, "r", newline="") as f:
@@ -1194,7 +1051,6 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
             "ema10_at_match": r.ema10,
             "rs_vs_sector_at_match": r.rs_vs_sector_pct if r.rs_vs_sector_pct is not None else "",
             "monthly_confirmed": r.monthly_confirmed,
-            "buy_tag": r.buy_tag,
         })
 
     if not new_rows:
@@ -1210,77 +1066,10 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
 
 
 MIN_MATURITY_WEEKS = 1.0  # matches held less than this are excluded from all-time stats (too new to mean anything)
-STALE_SCAN_WARNING_DAYS = 10  # scans run Mon/Fri, so a gap this long means something's likely broken
-MAX_LISTED_PER_SECTION = 10  # cap detailed per-stock listings in the report; rest gets a "+N more" summary
-
-
-def compute_exit_rule_outcome(symbol: str, match_week_date_str: str, entry_close: float,
-                               ema10_at_match: Optional[float],
-                               fallback_current_price: Optional[float]):
-    """
-    Checks whether the stated exit rule — a weekly close below the 10W EMA — would have
-    triggered since the match date. Buy-and-hold-to-today (what the rest of the report tracks)
-    isn't what the system actually does; this answers "what would this trade have actually
-    captured under the real exit rule," which is the honest measure of whether the system works.
-
-    LIGHTWEIGHT approach: EMA is a pure recursive function of (prior EMA, new close) — so instead
-    of re-pulling years of history to recompute the 10W EMA from scratch, this seeds the
-    recursion from ema10_at_match (already stored in match_history.csv at scan time) and only
-    fetches price data from the week AFTER the match forward. For a typical few-weeks-old match
-    that's a handful of days fetched, not two years.
-
-    Falls back to the hold-to-today number if the seed is missing (e.g. a pre-migration CSV row)
-    or the fetch comes back empty (nothing's happened since the match yet).
-    """
-    fallback = lambda: {
-        "exited": False, "exit_date": None, "exit_close": None,
-        "rule_return_pct": round((fallback_current_price / entry_close - 1) * 100, 2) if fallback_current_price else None,
-    }
-
-    if not ema10_at_match:
-        return fallback()
-
-    match_date = pd.to_datetime(match_week_date_str)
-    start = match_date + pd.Timedelta(days=1)
-    ticker = f"{symbol}.NS"
-    daily = _download_with_retry_since(ticker, start, label=symbol)
-    if daily is None or daily.empty:
-        return fallback()  # nothing's traded since the match yet, or fetch failed
-
-    if isinstance(daily.columns, pd.MultiIndex):
-        daily.columns = daily.columns.get_level_values(0)
-    daily.columns = [c.lower() for c in daily.columns]
-    if "close" not in daily.columns:
-        return fallback()
-
-    weekly = daily.resample("W-FRI").agg({"close": "last"}).dropna()
-    if weekly.empty:
-        return fallback()
-    today = pd.Timestamp.now().normalize()
-    if weekly.index[-1] > today:
-        weekly = weekly.iloc[:-1]  # drop an incomplete in-progress week
-    if weekly.empty:
-        return fallback()
-
-    alpha = 2 / (10 + 1)  # span=10 EMA, matching compute_indicators()
-    ema = float(ema10_at_match)
-    for date, row in weekly.iterrows():
-        close = float(row["close"])
-        ema = close * alpha + ema * (1 - alpha)
-        if close < ema:
-            exit_close = round(close, 2)
-            return {
-                "exited": True,
-                "exit_date": str(date.date()),
-                "exit_close": exit_close,
-                "rule_return_pct": round((exit_close / entry_close - 1) * 100, 2),
-            }
-
-    return fallback()
 
 
 def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
-                            csv_path: str = MATCH_HISTORY_CSV, workers: int = DEFAULT_WORKERS) -> str:
+                           csv_path: str = MATCH_HISTORY_CSV, workers: int = DEFAULT_WORKERS) -> str:
     """
     Reads match_history.csv, builds the recent-window digest (last `lookback_weeks`) plus
     an all-time cumulative track record (all matured matches, ever) so you have a running
@@ -1294,20 +1083,6 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
 
     if not rows:
         return "*Weekly Performance Report*\nMatch history is empty — nothing to report."
-
-    # --- Stale-scan check: catches a silently-broken scan schedule (e.g. the cron trigger not
-    # firing) instead of the report just quietly showing fewer new matches with no explanation. ---
-    stale_warning = ""
-    try:
-        last_scan_date = max(pd.to_datetime(r["scan_run_date"]) for r in rows if r.get("scan_run_date"))
-        days_since_scan = (pd.Timestamp.now().normalize() - last_scan_date).days
-        if days_since_scan > STALE_SCAN_WARNING_DAYS:
-            stale_warning = (
-                f"⚠️ *No new matches logged in {days_since_scan} days* (last: {last_scan_date.date()}). "
-                f"The scan workflow may not be running — check the Actions tab.\n\n"
-            )
-    except (ValueError, KeyError):
-        pass
 
     # Fetch current price for EVERY symbol ever logged, once — powers both the recent-window
     # section and the all-time scoreboard below, so we're not double-fetching.
@@ -1331,74 +1106,30 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
         entry = float(r["close_at_match"])
         pct_return = round((current / entry - 1) * 100, 2) if current else None
         weeks_held = round((pd.Timestamp.now().normalize() - pd.to_datetime(r["week_date"])).days / 7, 1)
-        is_buy = str(r.get("buy_tag", "")).strip().lower() in ("true", "1")
-        all_enriched.append({**r, "current_price": current, "pct_return": pct_return,
-                              "weeks_held": weeks_held, "is_buy": is_buy})
+        all_enriched.append({**r, "current_price": current, "pct_return": pct_return, "weeks_held": weeks_held})
 
-    # Exit-rule enrichment: buy-and-hold-to-today isn't what the system actually does — check
-    # every MATURED buy-tagged match, across the FULL history (not just this report's lookback
-    # window), against the real exit rule (weekly close < 10W EMA). Runs here, before the window
-    # is sliced out, so the all-time scoreboard and the recent-window section both use the same
-    # rule-based numbers for buy-tagged stocks. Scoped to buy-tagged + matured only. The check
-    # itself is now lightweight (seeded EMA + since-match fetch only, not a full history repull),
-    # so this scales fine even as buy-tagged history grows.
-    buy_matured_all = [e for e in all_enriched if e["weeks_held"] >= MIN_MATURITY_WEEKS]
-    if buy_matured_all:
-        print(f"Checking exit rule for {len(buy_matured_all)} matured buy setup(s)...")
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_entry = {
-                executor.submit(
-                    compute_exit_rule_outcome, e["symbol"], e["week_date"],
-                    float(e["close_at_match"]),
-                    float(e["ema10_at_match"]) if e.get("ema10_at_match") not in (None, "") else None,
-                    e["current_price"],
-                ): e
-                for e in buy_matured_all
-            }
-            for future in as_completed(future_to_entry):
-                e = future_to_entry[future]
-                try:
-                    e["exit_rule"] = future.result()
-                except Exception as ex:
-                    print(f"  [{e['symbol']}] exit-rule check error: {ex}")
-                    e["exit_rule"] = None
-    for e in all_enriched:
-        e.setdefault("exit_rule", None)
-
-    def _rule_return(e: dict):
-        """Effective return for a match: realized/unrealized exit-rule return where computable
-        (now checked for every matured match, not just buy-tagged), otherwise falls back to the
-        plain hold-to-today return."""
-        er = e.get("exit_rule")
-        if er and er["rule_return_pct"] is not None:
-            return er["rule_return_pct"]
-        return e["pct_return"]
-
-    def _scoreboard_for(subset: list, title: str) -> str:
-        matured = [e for e in subset if e["pct_return"] is not None and e["weeks_held"] >= MIN_MATURITY_WEEKS]
-        if not matured:
-            return f"\n{title}\n   No matches have matured yet (need ≥{MIN_MATURITY_WEEKS:g} week held).\n"
-        returns_ = [_rule_return(e) for e in matured]
-        wins = [x for x in returns_ if x > 0]
-        win_rate_ = round(len(wins) / len(returns_) * 100, 1)
-        avg_ = round(sum(returns_) / len(returns_), 2)
-        median_ = round(pd.Series(returns_).median(), 2)
-        best_idx = returns_.index(max(returns_))
-        worst_idx = returns_.index(min(returns_))
-        return (
-            f"\n{title}\n"
-            f"   {len(matured)} matured match(es)\n"
-            f"   Win rate: {win_rate_}% | Avg return: {avg_:+.2f}% | Median: {median_:+.2f}%\n"
-            f"   Best: {matured[best_idx]['symbol']} {returns_[best_idx]:+.2f}% | "
-            f"Worst: {matured[worst_idx]['symbol']} {returns_[worst_idx]:+.2f}%\n"
+    # --- All-time scoreboard (matured matches only, across full history) ---
+    matured_all = [e for e in all_enriched if e["pct_return"] is not None and e["weeks_held"] >= MIN_MATURITY_WEEKS]
+    if matured_all:
+        atw_winners = [e for e in matured_all if e["pct_return"] > 0]
+        atw_win_rate = round(len(atw_winners) / len(matured_all) * 100, 1)
+        atw_returns = [e["pct_return"] for e in matured_all]
+        atw_avg_return = round(sum(atw_returns) / len(atw_returns), 2)
+        atw_median_return = round(pd.Series(atw_returns).median(), 2)
+        atw_best = max(matured_all, key=lambda e: e["pct_return"])
+        atw_worst = min(matured_all, key=lambda e: e["pct_return"])
+        scoreboard = (
+            f"\n📊 *All-Time Track Record* (matured matches, held ≥{MIN_MATURITY_WEEKS:g}w)\n"
+            f"   {len(matured_all)} matured match(es) since logging began\n"
+            f"   Win rate: {atw_win_rate}% | Avg return: {atw_avg_return:+.2f}% | Median: {atw_median_return:+.2f}%\n"
+            f"   Best: {atw_best['symbol']} {atw_best['pct_return']:+.2f}% | "
+            f"Worst: {atw_worst['symbol']} {atw_worst['pct_return']:+.2f}%\n"
         )
-
-    # --- All-time scoreboards: overall AND buy-tag-only, side by side for comparison ---
-    buy_all = [e for e in all_enriched if e["is_buy"]]
-    scoreboard = (
-        _scoreboard_for(all_enriched, "📊 *All-Time Track Record* (all matches)")
-        + _scoreboard_for(buy_all, "✅ *All-Time Track Record — BUY SETUPS ONLY (rule-based return)*")
-    )
+    else:
+        scoreboard = (
+            f"\n📊 *All-Time Track Record*\n"
+            f"   No matches have matured yet (need ≥{MIN_MATURITY_WEEKS:g} week held) — check back soon.\n"
+        )
 
     # --- Recent-window section (unchanged behavior, just reuses the shared price fetch) ---
     cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(weeks=lookback_weeks)
@@ -1412,22 +1143,11 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     no_price = [e for e in enriched if e["pct_return"] is None]
     valid.sort(key=lambda e: e["pct_return"], reverse=True)
 
-    buy_valid = [e for e in valid if e["is_buy"]]
-    other_valid = [e for e in valid if not e["is_buy"]]
-
-    winners = [e for e in other_valid if _rule_return(e) > 0]
-    losers = [e for e in other_valid if _rule_return(e) <= 0]
-    # "Other matches" stats now also use the exit-rule return where computable, same as buy setups.
-    other_rule_returns = [_rule_return(e) for e in other_valid]
-    win_rate = round(len([x for x in other_rule_returns if x > 0]) / len(other_rule_returns) * 100, 1) if other_rule_returns else 0.0
-    avg_return = round(sum(other_rule_returns) / len(other_rule_returns), 2) if other_rule_returns else 0.0
-    median_return = round(pd.Series(other_rule_returns).median(), 2) if other_rule_returns else 0.0
-
-    # Buy-setup stats use the RULE-BASED return where available (realized exit, or still-open
-    # unrealized if the rule hasn't triggered) rather than a naive hold-to-today number.
-    buy_rule_returns = [_rule_return(e) for e in buy_valid]
-    buy_win_rate = round(len([x for x in buy_rule_returns if x > 0]) / len(buy_rule_returns) * 100, 1) if buy_rule_returns else 0.0
-    buy_avg_return = round(sum(buy_rule_returns) / len(buy_rule_returns), 2) if buy_rule_returns else 0.0
+    winners = [e for e in valid if e["pct_return"] > 0]
+    losers = [e for e in valid if e["pct_return"] <= 0]
+    win_rate = round(len(winners) / len(valid) * 100, 1) if valid else 0.0
+    avg_return = round(sum(e["pct_return"] for e in valid) / len(valid), 2) if valid else 0.0
+    median_return = round(pd.Series([e["pct_return"] for e in valid]).median(), 2) if valid else 0.0
 
     # Report the ACTUAL age spread of what's in this report, not just the search window —
     # "last 8 weeks" describes how far back we looked, not how long these matches have been
@@ -1438,94 +1158,45 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
 
     lines = [
         f"*Weekly Performance Report* — searched last {lookback_weeks} weeks of match history\n",
-        stale_warning,
         f"Matches span {min_age}–{max_age} week(s) old.\n",
     ]
     if max_age < 1:
         lines.append("⚠️ All matches are <1 week old — win rate/avg return below aren't meaningful yet, "
-                      "just noise from measuring too early. Check back after a few more weeks.\n")
+                     "just noise from measuring too early. Check back after a few more weeks.\n")
+    lines.append(
+        f"Tracked: {len(valid)} match(es) | Win rate: {win_rate}% | "
+        f"Avg return: {avg_return:+.2f}% | Median return: {median_return:+.2f}%\n"
+    )
+    if abs(avg_return - median_return) >= 5:
+        lines.append("_Avg and median diverge a lot — a few outliers are skewing the average; "
+                     "median is the more honest read here._\n")
 
-    def _fmt_stock_block(e: dict, label: str = "Scanned on") -> str:
+    def _fmt_stock_block(e: dict) -> str:
         arrow = "🟢" if e["pct_return"] > 0 else "🔴"
         if e["weeks_held"] >= 1:
             held_txt = f"held {e['weeks_held']} week(s)"
         else:
             held_txt = "held <1 week — still forming, don't read into this yet"
-        base = (
+        return (
             f"{arrow} *{e['symbol']}* [{e['sector']}]\n"
-            f"   {label}: {e['week_date']}\n"
+            f"   Scanned on: {e['week_date']}\n"
             f"   Entry price: ₹{e['close_at_match']}\n"
             f"   Current price: ₹{e['current_price']:.2f}\n"
-            f"   Move so far (hold-to-today): {e['pct_return']:+.2f}% ({held_txt})\n"
+            f"   Move so far: {e['pct_return']:+.2f}% ({held_txt})\n"
         )
-        er = e.get("exit_rule")
-        if er:
-            if er["exited"]:
-                base += (
-                    f"   📤 Exit rule triggered {er['exit_date']} @ ₹{er['exit_close']} "
-                    f"(weekly close < 10W EMA) — rule-based return: {er['rule_return_pct']:+.2f}%\n"
-                )
-            else:
-                base += "   📈 Exit rule not yet triggered — still holding per the system's own rule\n"
-        return base
-
-    def _append_capped(entries: list, label_fn, max_shown: int = MAX_LISTED_PER_SECTION):
-        """Lists up to max_shown entries in full detail, then collapses the rest into a
-        one-line summary — prevents the report from growing unbounded as match history piles
-        up over months (a big lookback window could otherwise list 50-100+ stocks every week)."""
-        shown, rest = entries[:max_shown], entries[max_shown:]
-        for e in shown:
-            lines.append(label_fn(e))
-        if rest:
-            rest_returns = [_rule_return(e) for e in rest]
-            avg_rest = round(sum(rest_returns) / len(rest_returns), 2) if rest_returns else None
-            avg_txt = f", avg return {avg_rest:+.2f}%" if avg_rest is not None else ""
-            lines.append(f"_...and {len(rest)} more{avg_txt}_\n")
-
-    # --- Dedicated BUY SETUP tracking block — this is the accountability piece ---
-    if buy_valid:
-        lines.append(
-            f"✅ *BUY SETUP TRACKING* ({len(buy_valid)}) — rule-based "
-            f"Win rate: {buy_win_rate}% | Avg return: {buy_avg_return:+.2f}%\n"
-            f"_(uses realized exit-rule return where matured; hold-to-today for anything too new to check)_\n"
-        )
-        _append_capped(buy_valid, lambda e: _fmt_stock_block(e, label="Bought on"))
-
-    lines.append(
-        f"\n*Other matches:* {len(other_valid)} | Win rate: {win_rate}% | "
-        f"Avg return: {avg_return:+.2f}% | Median return: {median_return:+.2f}%\n"
-    )
-    if abs(avg_return - median_return) >= 5:
-        lines.append("_Avg and median diverge a lot — a few outliers are skewing the average; "
-                      "median is the more honest read here._\n")
 
     if winners:
         lines.append(f"\n🟢 *Winners* ({len(winners)}):")
-        _append_capped(winners, _fmt_stock_block)
+        for e in winners:  # already sorted best-first
+            lines.append(_fmt_stock_block(e))
 
     if losers:
         lines.append(f"🔴 *Losers / flat* ({len(losers)}):")
-        _append_capped(sorted(losers, key=lambda e: _rule_return(e)), _fmt_stock_block)  # worst-first
+        for e in sorted(losers, key=lambda e: e["pct_return"]):  # worst-first — the ones worth learning from
+            lines.append(_fmt_stock_block(e))
 
     if no_price:
         lines.append(f"_Could not fetch current price for: {', '.join(e['symbol'] for e in no_price)}_")
-
-    # --- Sector breakdown for this window — flags whether specific sectors are systematically
-    # dragging or driving performance, using the same rule-based return as everything else. ---
-    sector_groups: dict = {}
-    for e in valid:
-        sector_groups.setdefault(e.get("sector") or "Unknown", []).append(_rule_return(e))
-    if sector_groups:
-        sector_stats = []
-        for sector, rets in sector_groups.items():
-            wr = round(len([x for x in rets if x > 0]) / len(rets) * 100, 1)
-            avg = round(sum(rets) / len(rets), 2)
-            sector_stats.append((sector, len(rets), wr, avg))
-        sector_stats.sort(key=lambda x: -x[3])  # best avg return first
-        lines.append("\n📂 *Sector Breakdown* (this window):")
-        for sector, n, wr, avg in sector_stats:
-            lines.append(f"   {sector}: {n} match(es) | {wr}% win rate | {avg:+.2f}% avg")
-        lines.append("")
 
     lines.append(scoreboard)
 
@@ -1584,26 +1255,26 @@ def main():
     parser.add_argument("--backtest", action="store_true", help="Check the last N weeks instead of just the latest")
     parser.add_argument("--lookback-weeks", type=int, default=5, help="Weeks to check when --backtest is set")
     parser.add_argument("--delay", type=float, default=DEFAULT_PER_REQUEST_DELAY,
-                         help="Base per-worker seconds to sleep before each symbol download (jitter added on top)")
+                        help="Base per-worker seconds to sleep before each symbol download (jitter added on top)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                         help="Number of symbols to scan in parallel (I/O-bound; keep modest to avoid Yahoo rate limits)")
+                        help="Number of symbols to scan in parallel (I/O-bound; keep modest to avoid Yahoo rate limits)")
     parser.add_argument("--limit", type=int, default=None, help="Only scan the first N symbols (useful for quick tests)")
     parser.add_argument("--explain", type=str, default=None,
-                         help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
+                        help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
     parser.add_argument("--rs-debug", action="store_true",
-                         help="Print a reason for every stock where RS vs Sector comes back N/A")
+                        help="Print a reason for every stock where RS vs Sector comes back N/A")
     parser.add_argument("--gate-debug", action="store_true",
-                         help="Print a histogram of which condition (52W high, base duration, "
-                              "uptrend, ADX, EMA proximity) is rejecting the most stocks this run")
+                        help="Print a histogram of which condition (52W high, base duration, "
+                             "uptrend, ADX, EMA proximity) is rejecting the most stocks this run")
     parser.add_argument("--no-log-history", action="store_true",
-                         help="Don't append this run's matches to match_history.csv")
+                        help="Don't append this run's matches to match_history.csv")
     parser.add_argument("--weekly-report", action="store_true",
-                         help="Skip scanning; send a performance/journal digest of past matches to Telegram instead")
+                        help="Skip scanning; send a performance/journal digest of past matches to Telegram instead")
     parser.add_argument("--report-lookback-weeks", type=int, default=DEFAULT_REPORT_LOOKBACK_WEEKS,
-                         help="How many weeks of match history to include in --weekly-report")
+                        help="How many weeks of match history to include in --weekly-report")
     parser.add_argument("--with-weekly-report", action="store_true",
-                         help="After a normal scan, append the performance/journal digest to the SAME "
-                              "Telegram message instead of sending it separately")
+                        help="After a normal scan, append the performance/journal digest to the SAME "
+                             "Telegram message instead of sending it separately")
     args = parser.parse_args()
 
     if args.explain:
