@@ -1,7 +1,7 @@
 """
 EMA Squeeze Base Scanner (symbols embedded — no external file needed)
 -----------------------------------------------------------------------
-Weekly-timeframe scan for RKScanBot.
+Weekly-timeframe scan for RKScanBot with Automated Threat Detection.
 
 Flags stocks where:
   1. 5W / 10W / 20W EMAs are compressed (tight spread) relative to price
@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
 
@@ -414,6 +414,7 @@ class ScanResult:
     buy_tag: bool = False
     stop_loss: Optional[float] = None
     risk_pct: Optional[float] = None
+    threats: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +637,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Scan logic
+# Scan logic & Automated Threat Detection
 # ---------------------------------------------------------------------------
 
 def _base_duration_weeks(df: pd.DataFrame, idx: int, near_pct: float = NEAR_EMA_PCT) -> int:
@@ -694,7 +695,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     near_ema20 = dist_ema20 <= NEAR_EMA_PCT
     near_any = near_ema5 or near_ema10 or near_ema20
 
-    # Ensure the 40W EMA baseline is sloping upward (not flat or rolling over)
+    # Ensure the 40W EMA baseline is sloping upward
     ema40_sloping_up = True
     if idx >= 4:
         ema40_prev = df.iloc[idx - 4]["ema40"]
@@ -750,12 +751,23 @@ def _build_scan_result(evald: dict, df: pd.DataFrame, idx: int) -> ScanResult:
     row = evald["row"]
     base_weeks = evald["base_weeks"] or 4
 
-    # Automatic Stop-Loss Calculation: Lowest low of the base window buffered by 1%
+    # Automatic Stop-Loss & Risk Calculation
     start_base_idx = max(0, idx - base_weeks)
     base_slice = df.iloc[start_base_idx : idx + 1]
     lowest_low = base_slice["low"].min()
     stop_loss = round(lowest_low * 0.99, 2)
     risk_pct = round((row.close - stop_loss) / row.close * 100, 2)
+
+    # --- Automated Threat Detection Engine ---
+    threats = []
+    if risk_pct > 7.0:
+        threats.append(f"Wide stop risk ({risk_pct}%)")
+    if evald["vol_contracting"] is False:
+        threats.append("Volume elevated through base")
+    if evald["dist_from_52w_high_pct"] is not None and evald["dist_from_52w_high_pct"] > 18.0:
+        threats.append(f"Deep off high ({evald['dist_from_52w_high_pct']}%)")
+    if row.rsi14 is not None and row.rsi14 > 68:
+        threats.append(f"RSI slightly extended ({row.rsi14:.1f})")
 
     dist_ema10 = abs(row.close - row.ema10) / row.close
     dist_ema20 = abs(row.close - row.ema20) / row.close
@@ -795,6 +807,7 @@ def _build_scan_result(evald: dict, df: pd.DataFrame, idx: int) -> ScanResult:
         buy_tag=buy_tag,
         stop_loss=stop_loss,
         risk_pct=risk_pct,
+        threats=threats,
     )
 
 
@@ -972,6 +985,8 @@ def format_results_message(results: List[ScanResult]) -> str:
             vol_bits.append("contracted into base")
         vol_txt = " | ".join(vol_bits) if vol_bits else "vol profile n/a"
 
+        threats_txt = f"\n  ⚠️ *Threats:* {', '.join(r.threats)}" if r.threats else ""
+
         return (
             f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}{' ✅ *BUY SETUP*' if r.buy_tag else ''}\n"
             f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20}\n"
@@ -979,7 +994,7 @@ def format_results_message(results: List[ScanResult]) -> str:
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
             f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
             f"  {off_high_txt} | {base_txt} ({tightness_txt})\n"
-            f"  🎯 *{sl_txt}* | {vol_txt}\n"
+            f"  🎯 *{sl_txt}* | {vol_txt}{threats_txt}\n"
         )
 
     buy_setups = [r for r in results if r.buy_tag]
