@@ -496,6 +496,40 @@ def _download_with_retry(ticker: str, period: str, label: str) -> Optional[pd.Da
     return None
 
 
+def _download_with_retry_since(ticker: str, start_date, label: str) -> Optional[pd.DataFrame]:
+    """
+    Like _download_with_retry, but pulls from a specific start date forward instead of a fixed
+    period — used where we only need data since some known point (e.g. a match date), so we're
+    not re-downloading years of history just to check the last few weeks.
+    """
+    last_err = None
+    for attempt in range(DOWNLOAD_RETRIES):
+        try:
+            daily = yf.download(
+                ticker, start=start_date, interval="1d", progress=False,
+                auto_adjust=True, timeout=15,
+            )
+            if daily is not None and not daily.empty:
+                return daily
+            last_err = "download() returned empty DataFrame"
+        except Exception as e:
+            last_err = f"download() raised: {e}"
+
+        if attempt < DOWNLOAD_RETRIES - 1:
+            sleep_for = DOWNLOAD_BACKOFF_SECONDS[min(attempt, len(DOWNLOAD_BACKOFF_SECONDS) - 1)]
+            time.sleep(sleep_for)
+
+    try:
+        hist = yf.Ticker(ticker).history(start=start_date, interval="1d", auto_adjust=True, timeout=15)
+        if hist is not None and not hist.empty:
+            return hist
+    except Exception as e:
+        last_err = f"{last_err} | Ticker().history() raised: {e}"
+
+    print(f"  [{label}] since-fetch failed: {last_err}")
+    return None
+
+
 def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
     ticker = f"{symbol}.NS"
     daily = _download_with_retry(ticker, period, label=symbol)
@@ -1176,6 +1210,73 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
 
 
 MIN_MATURITY_WEEKS = 1.0  # matches held less than this are excluded from all-time stats (too new to mean anything)
+STALE_SCAN_WARNING_DAYS = 10  # scans run Mon/Fri, so a gap this long means something's likely broken
+MAX_LISTED_PER_SECTION = 10  # cap detailed per-stock listings in the report; rest gets a "+N more" summary
+
+
+def compute_exit_rule_outcome(symbol: str, match_week_date_str: str, entry_close: float,
+                               ema10_at_match: Optional[float],
+                               fallback_current_price: Optional[float]):
+    """
+    Checks whether the stated exit rule — a weekly close below the 10W EMA — would have
+    triggered since the match date. Buy-and-hold-to-today (what the rest of the report tracks)
+    isn't what the system actually does; this answers "what would this trade have actually
+    captured under the real exit rule," which is the honest measure of whether the system works.
+
+    LIGHTWEIGHT approach: EMA is a pure recursive function of (prior EMA, new close) — so instead
+    of re-pulling years of history to recompute the 10W EMA from scratch, this seeds the
+    recursion from ema10_at_match (already stored in match_history.csv at scan time) and only
+    fetches price data from the week AFTER the match forward. For a typical few-weeks-old match
+    that's a handful of days fetched, not two years.
+
+    Falls back to the hold-to-today number if the seed is missing (e.g. a pre-migration CSV row)
+    or the fetch comes back empty (nothing's happened since the match yet).
+    """
+    fallback = lambda: {
+        "exited": False, "exit_date": None, "exit_close": None,
+        "rule_return_pct": round((fallback_current_price / entry_close - 1) * 100, 2) if fallback_current_price else None,
+    }
+
+    if not ema10_at_match:
+        return fallback()
+
+    match_date = pd.to_datetime(match_week_date_str)
+    start = match_date + pd.Timedelta(days=1)
+    ticker = f"{symbol}.NS"
+    daily = _download_with_retry_since(ticker, start, label=symbol)
+    if daily is None or daily.empty:
+        return fallback()  # nothing's traded since the match yet, or fetch failed
+
+    if isinstance(daily.columns, pd.MultiIndex):
+        daily.columns = daily.columns.get_level_values(0)
+    daily.columns = [c.lower() for c in daily.columns]
+    if "close" not in daily.columns:
+        return fallback()
+
+    weekly = daily.resample("W-FRI").agg({"close": "last"}).dropna()
+    if weekly.empty:
+        return fallback()
+    today = pd.Timestamp.now().normalize()
+    if weekly.index[-1] > today:
+        weekly = weekly.iloc[:-1]  # drop an incomplete in-progress week
+    if weekly.empty:
+        return fallback()
+
+    alpha = 2 / (10 + 1)  # span=10 EMA, matching compute_indicators()
+    ema = float(ema10_at_match)
+    for date, row in weekly.iterrows():
+        close = float(row["close"])
+        ema = close * alpha + ema * (1 - alpha)
+        if close < ema:
+            exit_close = round(close, 2)
+            return {
+                "exited": True,
+                "exit_date": str(date.date()),
+                "exit_close": exit_close,
+                "rule_return_pct": round((exit_close / entry_close - 1) * 100, 2),
+            }
+
+    return fallback()
 
 
 def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
@@ -1193,6 +1294,20 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
 
     if not rows:
         return "*Weekly Performance Report*\nMatch history is empty — nothing to report."
+
+    # --- Stale-scan check: catches a silently-broken scan schedule (e.g. the cron trigger not
+    # firing) instead of the report just quietly showing fewer new matches with no explanation. ---
+    stale_warning = ""
+    try:
+        last_scan_date = max(pd.to_datetime(r["scan_run_date"]) for r in rows if r.get("scan_run_date"))
+        days_since_scan = (pd.Timestamp.now().normalize() - last_scan_date).days
+        if days_since_scan > STALE_SCAN_WARNING_DAYS:
+            stale_warning = (
+                f"⚠️ *No new matches logged in {days_since_scan} days* (last: {last_scan_date.date()}). "
+                f"The scan workflow may not be running — check the Actions tab.\n\n"
+            )
+    except (ValueError, KeyError):
+        pass
 
     # Fetch current price for EVERY symbol ever logged, once — powers both the recent-window
     # section and the all-time scoreboard below, so we're not double-fetching.
@@ -1220,30 +1335,69 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
         all_enriched.append({**r, "current_price": current, "pct_return": pct_return,
                               "weeks_held": weeks_held, "is_buy": is_buy})
 
+    # Exit-rule enrichment: buy-and-hold-to-today isn't what the system actually does — check
+    # every MATURED buy-tagged match, across the FULL history (not just this report's lookback
+    # window), against the real exit rule (weekly close < 10W EMA). Runs here, before the window
+    # is sliced out, so the all-time scoreboard and the recent-window section both use the same
+    # rule-based numbers for buy-tagged stocks. Scoped to buy-tagged + matured only. The check
+    # itself is now lightweight (seeded EMA + since-match fetch only, not a full history repull),
+    # so this scales fine even as buy-tagged history grows.
+    buy_matured_all = [e for e in all_enriched if e["weeks_held"] >= MIN_MATURITY_WEEKS]
+    if buy_matured_all:
+        print(f"Checking exit rule for {len(buy_matured_all)} matured buy setup(s)...")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_entry = {
+                executor.submit(
+                    compute_exit_rule_outcome, e["symbol"], e["week_date"],
+                    float(e["close_at_match"]),
+                    float(e["ema10_at_match"]) if e.get("ema10_at_match") not in (None, "") else None,
+                    e["current_price"],
+                ): e
+                for e in buy_matured_all
+            }
+            for future in as_completed(future_to_entry):
+                e = future_to_entry[future]
+                try:
+                    e["exit_rule"] = future.result()
+                except Exception as ex:
+                    print(f"  [{e['symbol']}] exit-rule check error: {ex}")
+                    e["exit_rule"] = None
+    for e in all_enriched:
+        e.setdefault("exit_rule", None)
+
+    def _rule_return(e: dict):
+        """Effective return for a match: realized/unrealized exit-rule return where computable
+        (now checked for every matured match, not just buy-tagged), otherwise falls back to the
+        plain hold-to-today return."""
+        er = e.get("exit_rule")
+        if er and er["rule_return_pct"] is not None:
+            return er["rule_return_pct"]
+        return e["pct_return"]
+
     def _scoreboard_for(subset: list, title: str) -> str:
         matured = [e for e in subset if e["pct_return"] is not None and e["weeks_held"] >= MIN_MATURITY_WEEKS]
         if not matured:
             return f"\n{title}\n   No matches have matured yet (need ≥{MIN_MATURITY_WEEKS:g} week held).\n"
-        wins = [e for e in matured if e["pct_return"] > 0]
-        win_rate_ = round(len(wins) / len(matured) * 100, 1)
-        returns_ = [e["pct_return"] for e in matured]
+        returns_ = [_rule_return(e) for e in matured]
+        wins = [x for x in returns_ if x > 0]
+        win_rate_ = round(len(wins) / len(returns_) * 100, 1)
         avg_ = round(sum(returns_) / len(returns_), 2)
         median_ = round(pd.Series(returns_).median(), 2)
-        best_ = max(matured, key=lambda e: e["pct_return"])
-        worst_ = min(matured, key=lambda e: e["pct_return"])
+        best_idx = returns_.index(max(returns_))
+        worst_idx = returns_.index(min(returns_))
         return (
             f"\n{title}\n"
             f"   {len(matured)} matured match(es)\n"
             f"   Win rate: {win_rate_}% | Avg return: {avg_:+.2f}% | Median: {median_:+.2f}%\n"
-            f"   Best: {best_['symbol']} {best_['pct_return']:+.2f}% | "
-            f"Worst: {worst_['symbol']} {worst_['pct_return']:+.2f}%\n"
+            f"   Best: {matured[best_idx]['symbol']} {returns_[best_idx]:+.2f}% | "
+            f"Worst: {matured[worst_idx]['symbol']} {returns_[worst_idx]:+.2f}%\n"
         )
 
     # --- All-time scoreboards: overall AND buy-tag-only, side by side for comparison ---
     buy_all = [e for e in all_enriched if e["is_buy"]]
     scoreboard = (
         _scoreboard_for(all_enriched, "📊 *All-Time Track Record* (all matches)")
-        + _scoreboard_for(buy_all, "✅ *All-Time Track Record — BUY SETUPS ONLY*")
+        + _scoreboard_for(buy_all, "✅ *All-Time Track Record — BUY SETUPS ONLY (rule-based return)*")
     )
 
     # --- Recent-window section (unchanged behavior, just reuses the shared price fetch) ---
@@ -1261,14 +1415,19 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
     buy_valid = [e for e in valid if e["is_buy"]]
     other_valid = [e for e in valid if not e["is_buy"]]
 
-    winners = [e for e in other_valid if e["pct_return"] > 0]
-    losers = [e for e in other_valid if e["pct_return"] <= 0]
-    win_rate = round(len(winners) / len(other_valid) * 100, 1) if other_valid else 0.0
-    avg_return = round(sum(e["pct_return"] for e in other_valid) / len(other_valid), 2) if other_valid else 0.0
-    median_return = round(pd.Series([e["pct_return"] for e in other_valid]).median(), 2) if other_valid else 0.0
+    winners = [e for e in other_valid if _rule_return(e) > 0]
+    losers = [e for e in other_valid if _rule_return(e) <= 0]
+    # "Other matches" stats now also use the exit-rule return where computable, same as buy setups.
+    other_rule_returns = [_rule_return(e) for e in other_valid]
+    win_rate = round(len([x for x in other_rule_returns if x > 0]) / len(other_rule_returns) * 100, 1) if other_rule_returns else 0.0
+    avg_return = round(sum(other_rule_returns) / len(other_rule_returns), 2) if other_rule_returns else 0.0
+    median_return = round(pd.Series(other_rule_returns).median(), 2) if other_rule_returns else 0.0
 
-    buy_win_rate = round(len([e for e in buy_valid if e["pct_return"] > 0]) / len(buy_valid) * 100, 1) if buy_valid else 0.0
-    buy_avg_return = round(sum(e["pct_return"] for e in buy_valid) / len(buy_valid), 2) if buy_valid else 0.0
+    # Buy-setup stats use the RULE-BASED return where available (realized exit, or still-open
+    # unrealized if the rule hasn't triggered) rather than a naive hold-to-today number.
+    buy_rule_returns = [_rule_return(e) for e in buy_valid]
+    buy_win_rate = round(len([x for x in buy_rule_returns if x > 0]) / len(buy_rule_returns) * 100, 1) if buy_rule_returns else 0.0
+    buy_avg_return = round(sum(buy_rule_returns) / len(buy_rule_returns), 2) if buy_rule_returns else 0.0
 
     # Report the ACTUAL age spread of what's in this report, not just the search window —
     # "last 8 weeks" describes how far back we looked, not how long these matches have been
@@ -1279,6 +1438,7 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
 
     lines = [
         f"*Weekly Performance Report* — searched last {lookback_weeks} weeks of match history\n",
+        stale_warning,
         f"Matches span {min_age}–{max_age} week(s) old.\n",
     ]
     if max_age < 1:
@@ -1291,22 +1451,45 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
             held_txt = f"held {e['weeks_held']} week(s)"
         else:
             held_txt = "held <1 week — still forming, don't read into this yet"
-        return (
+        base = (
             f"{arrow} *{e['symbol']}* [{e['sector']}]\n"
             f"   {label}: {e['week_date']}\n"
             f"   Entry price: ₹{e['close_at_match']}\n"
             f"   Current price: ₹{e['current_price']:.2f}\n"
-            f"   Move so far: {e['pct_return']:+.2f}% ({held_txt})\n"
+            f"   Move so far (hold-to-today): {e['pct_return']:+.2f}% ({held_txt})\n"
         )
+        er = e.get("exit_rule")
+        if er:
+            if er["exited"]:
+                base += (
+                    f"   📤 Exit rule triggered {er['exit_date']} @ ₹{er['exit_close']} "
+                    f"(weekly close < 10W EMA) — rule-based return: {er['rule_return_pct']:+.2f}%\n"
+                )
+            else:
+                base += "   📈 Exit rule not yet triggered — still holding per the system's own rule\n"
+        return base
+
+    def _append_capped(entries: list, label_fn, max_shown: int = MAX_LISTED_PER_SECTION):
+        """Lists up to max_shown entries in full detail, then collapses the rest into a
+        one-line summary — prevents the report from growing unbounded as match history piles
+        up over months (a big lookback window could otherwise list 50-100+ stocks every week)."""
+        shown, rest = entries[:max_shown], entries[max_shown:]
+        for e in shown:
+            lines.append(label_fn(e))
+        if rest:
+            rest_returns = [_rule_return(e) for e in rest]
+            avg_rest = round(sum(rest_returns) / len(rest_returns), 2) if rest_returns else None
+            avg_txt = f", avg return {avg_rest:+.2f}%" if avg_rest is not None else ""
+            lines.append(f"_...and {len(rest)} more{avg_txt}_\n")
 
     # --- Dedicated BUY SETUP tracking block — this is the accountability piece ---
     if buy_valid:
         lines.append(
-            f"✅ *BUY SETUP TRACKING* ({len(buy_valid)}) — "
+            f"✅ *BUY SETUP TRACKING* ({len(buy_valid)}) — rule-based "
             f"Win rate: {buy_win_rate}% | Avg return: {buy_avg_return:+.2f}%\n"
+            f"_(uses realized exit-rule return where matured; hold-to-today for anything too new to check)_\n"
         )
-        for e in buy_valid:  # already sorted best-first
-            lines.append(_fmt_stock_block(e, label="Bought on"))
+        _append_capped(buy_valid, lambda e: _fmt_stock_block(e, label="Bought on"))
 
     lines.append(
         f"\n*Other matches:* {len(other_valid)} | Win rate: {win_rate}% | "
@@ -1318,16 +1501,31 @@ def generate_weekly_report(lookback_weeks: int = DEFAULT_REPORT_LOOKBACK_WEEKS,
 
     if winners:
         lines.append(f"\n🟢 *Winners* ({len(winners)}):")
-        for e in winners:  # already sorted best-first
-            lines.append(_fmt_stock_block(e))
+        _append_capped(winners, _fmt_stock_block)
 
     if losers:
         lines.append(f"🔴 *Losers / flat* ({len(losers)}):")
-        for e in sorted(losers, key=lambda e: e["pct_return"]):  # worst-first — the ones worth learning from
-            lines.append(_fmt_stock_block(e))
+        _append_capped(sorted(losers, key=lambda e: _rule_return(e)), _fmt_stock_block)  # worst-first
 
     if no_price:
         lines.append(f"_Could not fetch current price for: {', '.join(e['symbol'] for e in no_price)}_")
+
+    # --- Sector breakdown for this window — flags whether specific sectors are systematically
+    # dragging or driving performance, using the same rule-based return as everything else. ---
+    sector_groups: dict = {}
+    for e in valid:
+        sector_groups.setdefault(e.get("sector") or "Unknown", []).append(_rule_return(e))
+    if sector_groups:
+        sector_stats = []
+        for sector, rets in sector_groups.items():
+            wr = round(len([x for x in rets if x > 0]) / len(rets) * 100, 1)
+            avg = round(sum(rets) / len(rets), 2)
+            sector_stats.append((sector, len(rets), wr, avg))
+        sector_stats.sort(key=lambda x: -x[3])  # best avg return first
+        lines.append("\n📂 *Sector Breakdown* (this window):")
+        for sector, n, wr, avg in sector_stats:
+            lines.append(f"   {sector}: {n} match(es) | {wr}% win rate | {avg:+.2f}% avg")
+        lines.append("")
 
     lines.append(scoreboard)
 
