@@ -412,6 +412,8 @@ class ScanResult:
     vol_contracting: Optional[bool] = None
     tightness_label: Optional[str] = None
     buy_tag: bool = False
+    stop_loss: Optional[float] = None
+    risk_pct: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -744,8 +746,17 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     }
 
 
-def _build_scan_result(evald: dict) -> ScanResult:
+def _build_scan_result(evald: dict, df: pd.DataFrame, idx: int) -> ScanResult:
     row = evald["row"]
+    base_weeks = evald["base_weeks"] or 4
+
+    # Automatic Stop-Loss Calculation: Lowest low of the base window buffered by 1%
+    start_base_idx = max(0, idx - base_weeks)
+    base_slice = df.iloc[start_base_idx : idx + 1]
+    lowest_low = base_slice["low"].min()
+    stop_loss = round(lowest_low * 0.99, 2)
+    risk_pct = round((row.close - stop_loss) / row.close * 100, 2)
+
     dist_ema10 = abs(row.close - row.ema10) / row.close
     dist_ema20 = abs(row.close - row.ema20) / row.close
     compression_pct = round(min(dist_ema10, dist_ema20) * 100, 2)
@@ -777,11 +788,13 @@ def _build_scan_result(evald: dict) -> ScanResult:
         week_date=str(row.name.date()),
         monthly_confirmed=evald["monthly_confirmed"],
         dist_from_52w_high_pct=evald["dist_from_52w_high_pct"],
-        base_weeks=evald["base_weeks"],
+        base_weeks=base_weeks,
         breakout_vol_ratio=breakout_vol_ratio,
         vol_contracting=vol_contracting,
         tightness_label=tightness_label,
         buy_tag=buy_tag,
+        stop_loss=stop_loss,
+        risk_pct=risk_pct,
     )
 
 
@@ -791,7 +804,7 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         return None
     if not all(passed for passed, _ in evald["checks"].values()):
         return None
-    return _build_scan_result(evald)
+    return _build_scan_result(evald, df, idx)
 
 
 def check_row_with_reasons(df: pd.DataFrame, idx: int):
@@ -801,7 +814,7 @@ def check_row_with_reasons(df: pd.DataFrame, idx: int):
     checks = evald["checks"]
     if not all(passed for passed, _ in checks.values()):
         return None, checks
-    return _build_scan_result(evald), checks
+    return _build_scan_result(evald, df, idx), checks
 
 
 _sector_cache_lock = threading.Lock()
@@ -947,6 +960,7 @@ def format_results_message(results: List[ScanResult]) -> str:
         off_high_txt = f"{r.dist_from_52w_high_pct:.1f}% off 52W high" if r.dist_from_52w_high_pct is not None else "52W high n/a"
         base_txt = f"{r.base_weeks}w base" if r.base_weeks is not None else "base n/a"
         tightness_txt = r.tightness_label or "n/a"
+        sl_txt = f"SL: ₹{r.stop_loss} ({r.risk_pct}% risk)" if r.stop_loss is not None else "SL n/a"
 
         vol_bits = []
         if r.breakout_vol_ratio is not None:
@@ -960,12 +974,12 @@ def format_results_message(results: List[ScanResult]) -> str:
 
         return (
             f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}{' ✅ *BUY SETUP*' if r.buy_tag else ''}\n"
-            f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
+            f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20}\n"
             f"  Dist: 5W={dist_5:.1f}% | 10W={dist_10:.1f}% | 20W={dist_20:.1f}%\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
             f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
             f"  {off_high_txt} | {base_txt} ({tightness_txt})\n"
-            f"  {vol_txt}\n"
+            f"  🎯 *{sl_txt}* | {vol_txt}\n"
         )
 
     buy_setups = [r for r in results if r.buy_tag]
