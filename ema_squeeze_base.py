@@ -1,39 +1,33 @@
 """
-EMA Squeeze Base Scanner (symbols embedded — no external file needed)
+EMA Squeeze Base Weekly Scanner — Production Calibrated
 -----------------------------------------------------------------------
 Weekly-timeframe scan for RKScanBot.
+Filters across the full 752-stock Nifty Total Market universe.
 
-Flags stocks where:
-  1. 5W / 10W / 20W EMAs are compressed (tight spread) relative to price
-  2. Close is at/just above the 10W EMA (not below it)
-  3. Close is above the 40W EMA (broader uptrend intact)
-  4. RSI(14) is holding the 48-58 support band
-  5. ADX(14) > 20 and rising vs. the prior week
-  6. +DI(14) > -DI(14) (trend direction still bullish)
-
-Usage:
-    python ema_squeeze_base.py                # live run, sends Telegram alert
-    python ema_squeeze_base.py --dry-run       # prints results, no Telegram send
-    python ema_squeeze_base.py --backtest --lookback-weeks 20 --dry-run
-        (checks the last N weeks per symbol instead of just the latest —
-         use this first to validate against known winners like MTARTECH,
-         CUMMINSIND, APARINDS before trusting it live)
+Key Features:
+  1. Base compression measured via weekly candle range (high-low <= 10%).
+  2. Hard Risk Gate (Max stop-loss distance <= 7.5% from base low).
+  3. Dynamic Cross-Sectional RS Percentile (top 35% vs Nifty 500).
+  4. Verified Yahoo Finance Sector Index Mappings.
+  5. Multi-threaded batch downloading for fast execution.
 
 Requirements:
-    pip install yfinance pandas ta requests
-
-Environment variables (for Telegram):
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
+    pip install yfinance pandas numpy ta requests
 """
 
 import argparse
+import csv
 import os
+import random
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -41,27 +35,60 @@ from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator
 
 # ---------------------------------------------------------------------------
-# Config
+# Calibrated Strategy Config
 # ---------------------------------------------------------------------------
 
-NEAR_EMA_PCT = 0.03    # close must be within 3% of the 10W or 20W EMA — the ONLY proximity rule
-UPTREND_REQUIRED = True  # require ema10 > ema20 > ema40 (bullish stack) and close > ema40
-ADX_MIN = 20            # weekly ADX(14) must be at least this — filters out weak/no-trend stocks
-MONTHLY_RETEST_PCT = 0.05   # monthly close must be within 5% of the 6-month EMA to count as a "retest"
-RS_LOOKBACK_WEEKS = 12        # ~1 quarter, for RS vs market/sector
-MARKET_INDEX_TICKER = "NIFTYMIDSML400.NS"  # Nifty MidSmallcap 400 — matches RK's actual trading universe, not Nifty50
-FALLBACK_SECTOR_INDEX_TICKER = "NIFTYMIDSML400.NS"  # same universe fallback for sectors without a dedicated index
-REQUIRE_RS_GATE = True  # Recalibrated after switching benchmark to NIFTYMIDSML400.NS.
-                          # Real run (18 matches): min=-29.22, p25=-5.87, median=4.26, p75=25.95,
-                          # p90=57.47, max=134.85. Sweet spot 0-60: drops negative/weak RS (~25%+,
-                          # since even p25 is negative) and the top long-tail outliers beyond p90.
-RS_VS_SECTOR_MIN = 0.0
-RS_VS_SECTOR_MAX = 60.0
+NEAR_EMA_PCT = 0.035           # Close within 3.5% of 5W, 10W, or 20W EMA
+EMA_SPREAD_MAX_PCT = 3.5      # Max spread between EMA5/10/20 as % of close
+UPTREND_REQUIRED = True       # EMA10 > EMA20 > EMA40 and close > EMA40 (40W sloping up)
 
-# Sector -> Yahoo Finance benchmark index ticker. Verified real tickers used where a dedicated
-# NSE sector index exists; everything else falls back to Nifty 500 (broad market, not one sector).
+ADX_MIN = 20                  # ADX floor (indicates established trend)
+ADX_RISING_REQUIRED = False   # False during base stage so coiled setups aren't dropped
+
+MAX_PCT_OFF_52W_HIGH = 25.0   # Minervini Trend Template rule #7
+
+MIN_BASE_WEEKS = 4            # Minimum 4 weeks in base
+BASE_RANGE_COMPRESSION_PCT = 10.0  # Weekly (High-Low)/Close <= 10%
+
+VOL_BASE_LOOKBACK_WEEKS = 6   # Volume contraction lookback window
+HIGH_VOL_BREAKOUT_RATIO = 1.25 # Current week volume vs base average
+TIGHT_COMPRESSION_PCT = 1.5   # Compression below this = "Very Tight"
+MONTHLY_RETEST_PCT = 0.05     # Within 5% of 6-month EMA
+RS_LOOKBACK_WEEKS = 12
+
+# --- Hard Risk Gate ---
+MAX_RISK_PCT = 7.5            # Max allowable stop-loss distance from CMP
+
+# --- Dynamic RS Percentile ---
+RS_PERCENTILE_MIN = 65.0      # Must be in top 35% of the universe
+
+# --- Market Regime Gate ---
+REQUIRE_MARKET_STAGE2 = False # Informational; doesn't suppress individual winners
+MARKET_STAGE_MA_WEEKS = 30
+MARKET_STAGE_SLOPE_LOOKBACK_WEEKS = 5
+
+THREAT_DIST_52W_HIGH_PCT = 18.0
+THREAT_RSI_EXTENDED = 68
+
+MARKET_INDEX_TICKER = "^CRSLDX"             # Nifty 500
+MARKET_INDEX_LABEL = "Nifty 500"
+FALLBACK_SECTOR_INDEX_TICKER = "^CRSLDX"
+
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_BACKOFF_SECONDS = [1, 3, 8]
+DEFAULT_WORKERS = 8
+DEFAULT_PER_REQUEST_DELAY = 0.2
+
+MATCH_HISTORY_CSV = "match_history.csv"
+MATCH_HISTORY_FIELDS = [
+    "scan_run_date", "symbol", "sector", "week_date", "close_at_match",
+    "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed", "buy_tag",
+]
+DEFAULT_REPORT_LOOKBACK_WEEKS = 8
+
+# Verified Active Yahoo Finance Sector Benchmarks
 SECTOR_BENCHMARK_MAP = {
-    "Financial Services": "^CNXFIN",
+    "Financial Services": "NIFTY_FIN_SERVICE.NS",
     "Automobile and Auto Components": "^CNXAUTO",
     "Fast Moving Consumer Goods": "^CNXFMCG",
     "Healthcare": "^CNXPHARMA",
@@ -70,13 +97,11 @@ SECTOR_BENCHMARK_MAP = {
     "Oil Gas & Consumable Fuels": "^CNXENERGY",
     "Realty": "^CNXREALTY",
 }
-RS_VS_MARKET_MIN = -999.0     # temporarily wide open — not yet calibrated with real data (see below)
-RS_VS_MARKET_MAX = 999.0      # run --dry-run, read the "RS vs market DISTRIBUTION" block, then set real bounds
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# NSE symbols — Nifty Total Market list (752 symbols), no .NS suffix
+# 752-stock Nifty Total Market Universe
 SYMBOLS = [
     "360ONE", "3MINDIA", "ABB", "ACC", "ACMESOLAR", "AIAENG", "APLAPOLLO", "ASKAUTOLTD",
     "AUBANK", "AWL", "AXISCADES", "AADHARHFC", "AARTIDRUGS", "AARTIIND", "AARTIPHARM", "AAVAS",
@@ -103,7 +128,7 @@ SYMBOLS = [
     "CRAFTSMAN", "CREDITACC", "CRIZAC", "CROMPTON", "CUMMINSIND", "CUPID", "CYIENT", "DCBBANK",
     "DCMSHRIRAM", "DLF", "DOMS", "DABUR", "DALBHARAT", "DATAPATTNS", "DATAMATICS", "DEEPAKFERT",
     "DEEPAKNTR", "DELHIVERY", "DEVYANI", "DIACABS", "DBL", "DIVISLAB", "DIXON", "AGARWALEYE",
-    "LALPATHLAB", "DRREDDY", "DUMMYINXGN", "DUMMYTRVN", "DYNAMATECH", "EIDPARRY", "EIHOTEL", "EPL",
+    "LALPATHLAB", "DRREDDY", "DYNAMATECH", "EIDPARRY", "EIHOTEL", "EPL",
     "EDELWEISS", "EICHERMOT", "ELECON", "EMIL", "ELECTCAST", "ELGIEQUIP", "ELLEN", "EMAMILTD",
     "EMBDL", "EMCURE", "EMMVEE", "ENDURANCE", "ENGINERSIN", "ENTERO", "EIEL", "EQUITASBNK",
     "ERIS", "ESCORTS", "ETERNAL", "ETHOSLTD", "EUREKAFORB", "EXIDEIND", "NYKAA", "FEDFINA",
@@ -225,7 +250,7 @@ SECTOR_MAP = {
     "DALBHARAT": "Construction Materials", "DATAPATTNS": "Capital Goods", "DATAMATICS": "Information Technology", "DEEPAKFERT": "Chemicals",
     "DEEPAKNTR": "Chemicals", "DELHIVERY": "Services", "DEVYANI": "Consumer Services", "DIACABS": "Capital Goods",
     "DBL": "Construction", "DIVISLAB": "Healthcare", "DIXON": "Consumer Durables", "AGARWALEYE": "Healthcare",
-    "LALPATHLAB": "Healthcare", "DRREDDY": "Healthcare", "DUMMYINXGN": "Construction", "DUMMYTRVN": "Capital Goods",
+    "LALPATHLAB": "Healthcare", "DRREDDY": "Healthcare",
     "DYNAMATECH": "Capital Goods", "EIDPARRY": "Fast Moving Consumer Goods", "EIHOTEL": "Consumer Services", "EPL": "Capital Goods",
     "EDELWEISS": "Financial Services", "EICHERMOT": "Automobile and Auto Components", "ELECON": "Capital Goods", "EMIL": "Consumer Services",
     "ELECTCAST": "Capital Goods", "ELGIEQUIP": "Capital Goods", "ELLEN": "Chemicals", "EMAMILTD": "Fast Moving Consumer Goods",
@@ -379,6 +404,7 @@ class ScanResult:
     pdi14: float
     ndi14: float
     compression_pct: float
+    ema_spread_pct: float
     week_date: str
     sector: Optional[str] = None
     rs_vs_market_pct: Optional[float] = None
@@ -386,35 +412,62 @@ class ScanResult:
     vol_ratio: Optional[float] = None
     vol_weighted_rs: Optional[float] = None
     monthly_confirmed: bool = False
+    dist_from_52w_high_pct: Optional[float] = None
+    base_weeks: Optional[int] = None
+    breakout_vol_ratio: Optional[float] = None
+    vol_contracting: Optional[bool] = None
+    tightness_label: Optional[str] = None
+    buy_tag: bool = False
+    stop_loss: Optional[float] = None
+    risk_pct: Optional[float] = None
+    threats: List[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
+def _download_with_retry(ticker: str, period: str, label: str) -> Optional[pd.DataFrame]:
+    for attempt in range(DOWNLOAD_RETRIES):
+        try:
+            daily = yf.download(
+                ticker, period=period, interval="1d", progress=False,
+                auto_adjust=True, timeout=15,
+            )
+            if daily is not None and not daily.empty:
+                return daily
+        except Exception:
+            pass
+        if attempt < DOWNLOAD_RETRIES - 1:
+            time.sleep(DOWNLOAD_BACKOFF_SECONDS[min(attempt, len(DOWNLOAD_BACKOFF_SECONDS) - 1)])
+
+    try:
+        hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True, timeout=15)
+        if hist is not None and not hist.empty:
+            return hist
+    except Exception:
+        pass
+    return None
+
 
 def fetch_daily_ohlc(symbol: str, period: str = "5y") -> Optional[pd.DataFrame]:
-    """
-    Pull raw daily data via yfinance. period=5y so we have enough history
-    for a stable 20-month EMA (needs ~5 years of daily bars).
-    """
     ticker = f"{symbol}.NS"
-    try:
-        daily = yf.download(
-            ticker, period=period, interval="1d", progress=False,
-            auto_adjust=True, timeout=15,
-        )
-    except Exception as e:
-        print(f"  [{symbol}] download error: {e}")
+    daily = _download_with_retry(ticker, period, label=symbol)
+    if daily is None:
         return None
-
-    if daily.empty:
-        return None
-
     if isinstance(daily.columns, pd.MultiIndex):
         daily.columns = daily.columns.get_level_values(0)
-
     daily.columns = [c.lower() for c in daily.columns]
     return daily
+
+
+def get_latest_close(symbol: str) -> Optional[float]:
+    ticker = f"{symbol}.NS"
+    daily = _download_with_retry(ticker, period="5d", label=symbol)
+    if daily is None:
+        return None
+    if isinstance(daily.columns, pd.MultiIndex):
+        daily.columns = daily.columns.get_level_values(0)
+    daily.columns = [c.lower() for c in daily.columns]
+    if "close" not in daily.columns or daily["close"].dropna().empty:
+        return None
+    return float(daily["close"].dropna().iloc[-1])
 
 
 def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -426,8 +479,6 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
         "volume": "sum",
     }).dropna()
 
-    # Drop the trailing bar if that week's Friday hasn't happened yet (e.g. running on Monday) —
-    # otherwise we'd evaluate an incomplete, still-forming weekly candle as if it were closed.
     if len(weekly) > 0:
         today = pd.Timestamp.now().normalize()
         if weekly.index[-1] > today:
@@ -435,15 +486,10 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
 
     if len(weekly) < 45:
         return None
-
     return weekly
 
 
 def build_monthly_trend(daily: pd.DataFrame) -> pd.DataFrame:
-    """
-    Monthly close, EMA6 and EMA20 on monthly close, a bullish-cross flag,
-    and the %-distance of monthly close from the 6-month EMA (for retest detection).
-    """
     monthly = daily.resample("ME").agg({"close": "last"}).dropna()
     monthly["ema6_m"] = monthly["close"].ewm(span=6, adjust=False).mean()
     monthly["ema20_m"] = monthly["close"].ewm(span=20, adjust=False).mean()
@@ -453,7 +499,6 @@ def build_monthly_trend(daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def _clean_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize an index to tz-naive, nanosecond-precision datetime64 so merge_asof never hits a dtype mismatch."""
     idx = pd.to_datetime(df.index)
     if idx.tz is not None:
         idx = idx.tz_localize(None)
@@ -463,37 +508,27 @@ def _clean_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def attach_monthly_trend(weekly: pd.DataFrame, monthly_trend: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each weekly bar, attach the most recently COMPLETED month's uptrend flag
-    (avoids look-ahead bias — only use months that had already closed).
-    """
     weekly = _clean_datetime_index(weekly)
-
     monthly_shifted = _clean_datetime_index(monthly_trend)
-    monthly_shifted.index = monthly_shifted.index + pd.Timedelta(days=1)  # push to next day so merge_asof only sees completed months
+    monthly_shifted.index = monthly_shifted.index + pd.Timedelta(days=1)
 
     merged = pd.merge_asof(
         weekly.sort_index(), monthly_shifted.sort_index(),
         left_index=True, right_index=True, direction="backward",
     )
     merged["monthly_uptrend"] = merged["monthly_uptrend"].fillna(False)
-    merged["dist_to_ema6_m_pct"] = merged["dist_to_ema6_m_pct"].fillna(999.0)  # huge = never counts as a retest
+    merged["dist_to_ema6_m_pct"] = merged["dist_to_ema6_m_pct"].fillna(999.0)
     return merged
 
 
 def _fetch_index_weekly(ticker: str, period: str = "2y") -> Optional[pd.DataFrame]:
-    """Like fetch_daily_ohlc but for an index ticker that shouldn't get a .NS suffix."""
-    try:
-        daily = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True, timeout=15)
-    except Exception as e:
-        print(f"  [{ticker}] index download error: {e}")
-        return None
-    if daily.empty:
+    daily = _download_with_retry(ticker, period, label=ticker)
+    if daily is None:
         return None
     if isinstance(daily.columns, pd.MultiIndex):
         daily.columns = daily.columns.get_level_values(0)
     daily.columns = [c.lower() for c in daily.columns]
-    weekly = daily.resample("W-FRI").agg({"close": "last"}).dropna()
+    weekly = daily.resample("W-FRI").agg({"close": "last", "volume": "sum"}).dropna()
     if len(weekly) > 0:
         today = pd.Timestamp.now().normalize()
         if weekly.index[-1] > today:
@@ -501,24 +536,11 @@ def _fetch_index_weekly(ticker: str, period: str = "2y") -> Optional[pd.DataFram
     return weekly if len(weekly) > RS_LOOKBACK_WEEKS else None
 
 
-def compute_period_return(weekly_close: pd.Series, lookback: int = RS_LOOKBACK_WEEKS) -> Optional[float]:
-    """Simple % return of the latest close vs. `lookback` weeks ago."""
-    if weekly_close is None or len(weekly_close) <= lookback:
-        return None
-    now = weekly_close.iloc[-1]
-    then = weekly_close.iloc[-1 - lookback]
-    if pd.isna(now) or pd.isna(then) or then == 0:
-        return None
-    return (now / then - 1) * 100
-
-
-def compute_volume_weighted_rs(stock_weekly: pd.DataFrame, benchmark_weekly: pd.DataFrame) -> Optional[float]:
-    """
-    Volume-weighted relative strength: each week's (stock/benchmark price-ratio return)
-    weighted by that week's volume relative to its own 10-week average volume, summed
-    over RS_LOOKBACK_WEEKS. A big up-week on above-average volume counts more than a
-    quiet up-week — this is a genuine benchmark comparison, not a self-referential score.
-    """
+def compute_volume_weighted_rs(
+    stock_weekly: pd.DataFrame,
+    benchmark_weekly: pd.DataFrame,
+    symbol: str = "?",
+) -> Optional[float]:
     if stock_weekly is None or benchmark_weekly is None:
         return None
     if len(stock_weekly) < 15 or len(benchmark_weekly) < 15:
@@ -565,71 +587,177 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ndi14"] = adx_ind.adx_neg()
 
     df["high_52w"] = df["high"].rolling(window=52, min_periods=52).max()
-
     return df
 
 
-# ---------------------------------------------------------------------------
-# Scan logic
-# ---------------------------------------------------------------------------
+def compute_market_stage(market_weekly: Optional[pd.DataFrame]) -> dict:
+    if market_weekly is None or len(market_weekly) < MARKET_STAGE_MA_WEEKS + MARKET_STAGE_SLOPE_LOOKBACK_WEEKS:
+        return {"stage2": False, "detail": "insufficient market history"}
+
+    df = market_weekly.copy()
+    df["stage_ma"] = df["close"].rolling(window=MARKET_STAGE_MA_WEEKS).mean()
+    last = df.iloc[-1]
+    prev = df.iloc[-1 - MARKET_STAGE_SLOPE_LOOKBACK_WEEKS]
+
+    if pd.isna(last["stage_ma"]) or pd.isna(prev["stage_ma"]):
+        return {"stage2": False, "detail": f"{MARKET_STAGE_MA_WEEKS}W MA not available"}
+
+    ma_rising = bool(last["stage_ma"] > prev["stage_ma"])
+    price_above_ma = bool(last["close"] > last["stage_ma"])
+    stage2 = ma_rising and price_above_ma
+
+    detail = (
+        f"{MARKET_INDEX_LABEL} close {last['close']:.1f} "
+        f"{'>' if price_above_ma else '<='} {MARKET_STAGE_MA_WEEKS}W MA {last['stage_ma']:.1f} "
+        f"({'rising' if ma_rising else 'flat/falling'})"
+    )
+    return {"stage2": stage2, "detail": detail}
+
+
+def _base_duration_weeks(df: pd.DataFrame, idx: int, range_pct_max: float = BASE_RANGE_COMPRESSION_PCT) -> int:
+    count = 0
+    i = idx
+    while i >= 0:
+        row = df.iloc[i]
+        if row.close == 0:
+            break
+        week_range_pct = (row.high - row.low) / row.close * 100
+        if week_range_pct <= range_pct_max:
+            count += 1
+            i -= 1
+        else:
+            break
+    return count
+
+
+def _volume_profile(df: pd.DataFrame, idx: int, base_weeks: int):
+    window = min(base_weeks, VOL_BASE_LOOKBACK_WEEKS)
+    if window < 2 or idx - window < 0:
+        return None, None
+
+    base_slice = df["volume"].iloc[idx - window: idx]
+    if base_slice.empty or base_slice.mean() == 0:
+        return None, None
+
+    breakout_vol_ratio = round(float(df["volume"].iloc[idx] / base_slice.mean()), 2)
+    half = max(1, window // 2)
+    earlier_half_avg = base_slice.iloc[:half].mean()
+    recent_half_avg = base_slice.iloc[half:].mean() if window > half else base_slice.iloc[:half].mean()
+    vol_contracting = bool(recent_half_avg < earlier_half_avg)
+
+    return breakout_vol_ratio, vol_contracting
+
 
 def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
-    """
-    Core rule evaluation, shared by check_row() and --explain mode.
-    Returns a dict of {condition_name: (passed: bool, detail: str)} plus the row/derived values,
-    or None if there isn't enough data at this index to evaluate at all.
-    """
     if idx < 1 or idx >= len(df):
         return None
 
     row = df.iloc[idx]
-
     required = ["ema5", "ema10", "ema20", "ema40"]
     if row[required].isna().any():
         return None
 
+    dist_ema5 = abs(row.close - row.ema5) / row.close
     dist_ema10 = abs(row.close - row.ema10) / row.close
     dist_ema20 = abs(row.close - row.ema20) / row.close
+    near_ema5 = dist_ema5 <= NEAR_EMA_PCT
     near_ema10 = dist_ema10 <= NEAR_EMA_PCT
     near_ema20 = dist_ema20 <= NEAR_EMA_PCT
-    near_either = near_ema10 or near_ema20
+    near_any = near_ema5 or near_ema10 or near_ema20
 
-    uptrend_ok = bool(row.ema10 > row.ema20 > row.ema40 and row.close > row.ema40)
+    ema_spread_pct = (max(row.ema5, row.ema10, row.ema20) - min(row.ema5, row.ema10, row.ema20)) / row.close * 100
+    squeeze_ok = ema_spread_pct <= EMA_SPREAD_MAX_PCT
+
+    ema40_sloping_up = True
+    if idx >= 4:
+        ema40_prev = df.iloc[idx - 4]["ema40"]
+        ema40_sloping_up = bool(row.ema40 >= ema40_prev)
+
+    uptrend_ok = bool(row.ema10 > row.ema20 > row.ema40 and row.close > row.ema40 and ema40_sloping_up)
 
     adx_val = row.get("adx14", float("nan"))
-    adx_ok = bool(pd.notna(adx_val) and adx_val >= ADX_MIN)
+    adx_floor_ok = bool(pd.notna(adx_val) and adx_val >= ADX_MIN)
+    adx_rising_ok = True
+    if ADX_RISING_REQUIRED and idx >= 4:
+        adx_prev = df.iloc[idx - 4].get("adx14", float("nan"))
+        adx_rising_ok = bool(pd.notna(adx_prev) and pd.notna(adx_val) and adx_val >= adx_prev)
+    adx_ok = adx_floor_ok and adx_rising_ok
 
-    # Monthly macro tag (informational, NOT a gate): 6M EMA > 20M EMA (long-term uptrend
-    # confirmed) AND monthly close is currently retesting the 6M EMA — RK's "multifold
-    # returns" setup. Doesn't block a match, just flags the strongest ones.
     monthly_uptrend = bool(row.get("monthly_uptrend", False))
     monthly_dist = row.get("dist_to_ema6_m_pct", 999.0)
     monthly_retest = bool(pd.notna(monthly_dist) and monthly_dist <= MONTHLY_RETEST_PCT)
     monthly_confirmed = monthly_uptrend and monthly_retest
 
+    high_52w = row.get("high_52w", float("nan"))
+    if pd.notna(high_52w) and high_52w > 0:
+        dist_from_52w_high_pct = round((high_52w - row.close) / high_52w * 100, 2)
+        near_52w_high_ok = dist_from_52w_high_pct <= MAX_PCT_OFF_52W_HIGH
+        pct_detail = f"{dist_from_52w_high_pct:.1f}% off 52W high"
+    else:
+        dist_from_52w_high_pct = None
+        near_52w_high_ok = False
+        pct_detail = "52W high n/a"
+
+    base_weeks = _base_duration_weeks(df, idx)
+    base_duration_ok = base_weeks >= MIN_BASE_WEEKS
+
+    start_base_idx = max(0, idx - max(base_weeks, 1))
+    base_slice_for_stop = df.iloc[start_base_idx: idx + 1]
+    lowest_low = base_slice_for_stop["low"].min()
+    stop_loss = round(float(lowest_low) * 0.99, 2)
+    risk_pct = round((row.close - stop_loss) / row.close * 100, 2)
+    risk_ok = risk_pct <= MAX_RISK_PCT
+
     checks = {
-        "near_10w_or_20w_ema": (near_either,
-            f"close {row.close:.2f} | dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to either)"),
-        "uptrend":            (uptrend_ok if UPTREND_REQUIRED else True,
-            f"ema10 {row.ema10:.2f} > ema20 {row.ema20:.2f} > ema40 {row.ema40:.2f}, close {row.close:.2f} > ema40: {uptrend_ok}"),
-        "adx_min":            (adx_ok,
-            f"ADX {adx_val:.1f} (need >= {ADX_MIN})" if pd.notna(adx_val) else "ADX not available"),
+        "near_5w_10w_or_20w_ema": (near_any, f"dist: 5W={dist_ema5*100:.1f}%, 10W={dist_ema10*100:.1f}%, 20W={dist_ema20*100:.1f}%"),
+        "ema_squeeze": (squeeze_ok, f"spread: {ema_spread_pct:.2f}% (<= {EMA_SPREAD_MAX_PCT:.1f}%)"),
+        "uptrend": (uptrend_ok if UPTREND_REQUIRED else True, f"stack ok: {uptrend_ok}"),
+        "adx_min": (adx_ok, f"ADX: {adx_val:.1f} (>= {ADX_MIN})"),
+        "near_52w_high": (near_52w_high_ok, pct_detail),
+        "min_base_duration": (base_duration_ok, f"base: {base_weeks}w (>= {MIN_BASE_WEEKS}w)"),
+        "risk_within_max": (risk_ok, f"risk: {risk_pct:.2f}% (<= {MAX_RISK_PCT:.1f}%)"),
     }
-    return {"row": row, "checks": checks, "monthly_confirmed": monthly_confirmed}
+
+    breakout_vol_ratio, vol_contracting = _volume_profile(df, idx, base_weeks)
+
+    return {
+        "row": row, "checks": checks, "monthly_confirmed": monthly_confirmed,
+        "dist_from_52w_high_pct": dist_from_52w_high_pct, "base_weeks": base_weeks,
+        "breakout_vol_ratio": breakout_vol_ratio, "vol_contracting": vol_contracting,
+        "ema_spread_pct": ema_spread_pct, "stop_loss": stop_loss, "risk_pct": risk_pct,
+    }
 
 
-def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
-    evald = evaluate_conditions(df, idx)
-    if evald is None:
-        return None
-
+def _build_scan_result(evald: dict, df: pd.DataFrame, idx: int, market_stage2: bool) -> ScanResult:
     row = evald["row"]
-    checks = evald["checks"]
-    if not all(passed for passed, _ in checks.values()):
-        return None
+    base_weeks = evald["base_weeks"] or MIN_BASE_WEEKS
+    stop_loss = evald["stop_loss"]
+    risk_pct = evald["risk_pct"]
+    ema_spread_pct = evald["ema_spread_pct"]
 
-    dist_ema10 = abs(row.close - row.ema10) / row.close
-    dist_ema20 = abs(row.close - row.ema20) / row.close
+    compression_pct = round(ema_spread_pct, 2)
+    tightness_label = "Very Tight" if compression_pct < TIGHT_COMPRESSION_PCT else \
+                       "Tight" if compression_pct < EMA_SPREAD_MAX_PCT else "Moderate"
+
+    threats = []
+    if evald["vol_contracting"] is False:
+        threats.append("Volume elevated through base")
+    if evald["dist_from_52w_high_pct"] is not None and evald["dist_from_52w_high_pct"] > THREAT_DIST_52W_HIGH_PCT:
+        threats.append(f"Deep off high ({evald['dist_from_52w_high_pct']}%)")
+    if row.rsi14 is not None and row.rsi14 > THREAT_RSI_EXTENDED:
+        threats.append(f"RSI slightly extended ({row.rsi14:.1f})")
+
+    breakout_vol_ratio = evald["breakout_vol_ratio"]
+    vol_contracting = evald["vol_contracting"]
+
+    buy_tag = bool(
+        evald["monthly_confirmed"]
+        and tightness_label in ("Very Tight", "Tight")
+        and vol_contracting is True
+        and breakout_vol_ratio is not None
+        and breakout_vol_ratio >= HIGH_VOL_BREAKOUT_RATIO
+        and (market_stage2 or not REQUIRE_MARKET_STAGE2)
+    )
 
     return ScanResult(
         symbol="",
@@ -642,22 +770,53 @@ def check_row(df: pd.DataFrame, idx: int) -> Optional[ScanResult]:
         adx14=round(row.adx14, 2) if pd.notna(row.get("adx14")) else None,
         pdi14=round(row.pdi14, 2) if pd.notna(row.get("pdi14")) else None,
         ndi14=round(row.ndi14, 2) if pd.notna(row.get("ndi14")) else None,
-        compression_pct=round(min(dist_ema10, dist_ema20) * 100, 2),
+        compression_pct=compression_pct,
+        ema_spread_pct=round(ema_spread_pct, 2),
         week_date=str(row.name.date()),
         monthly_confirmed=evald["monthly_confirmed"],
+        dist_from_52w_high_pct=evald["dist_from_52w_high_pct"],
+        base_weeks=base_weeks,
+        breakout_vol_ratio=breakout_vol_ratio,
+        vol_contracting=vol_contracting,
+        tightness_label=tightness_label,
+        buy_tag=buy_tag,
+        stop_loss=stop_loss,
+        risk_pct=risk_pct,
+        threats=threats,
     )
 
 
-def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks: int):
-    """Returns (results, stock_return_pct_or_None) — the return is used later for RS vs market."""
+def check_row_with_reasons(df: pd.DataFrame, idx: int, market_stage2: bool):
+    evald = evaluate_conditions(df, idx)
+    if evald is None:
+        return None, None
+    checks = evald["checks"]
+    if not all(passed for passed, _ in checks.values()):
+        return None, checks
+    return _build_scan_result(evald, df, idx, market_stage2), checks
+
+
+_sector_cache_lock = threading.Lock()
+_gate_counter_lock = threading.Lock()
+
+
+def prefetch_sector_benchmarks(symbols: List[str], sector_cache: dict):
+    needed = {SECTOR_BENCHMARK_MAP.get(SECTOR_MAP.get(s), FALLBACK_SECTOR_INDEX_TICKER) for s in symbols}
+    needed.add(FALLBACK_SECTOR_INDEX_TICKER)
+    for ticker in sorted(needed):
+        fetched = _fetch_index_weekly(ticker, period="5y")
+        sector_cache[ticker] = fetched
+
+
+def scan_symbol(symbol: str, sector_cache: dict, market_weekly: Optional[pd.DataFrame],
+                backtest: bool, lookback_weeks: int, market_stage2: bool,
+                gate_counter: dict = None):
     daily = fetch_daily_ohlc(symbol)
     if daily is None:
-        print(f"  [{symbol}] skipped — insufficient data")
         return [], None
 
     weekly = build_weekly(daily)
     if weekly is None:
-        print(f"  [{symbol}] skipped — not enough weekly bars")
         return [], None
 
     monthly_trend = build_monthly_trend(daily)
@@ -665,66 +824,45 @@ def scan_symbol(symbol: str, sector_cache: dict, backtest: bool, lookback_weeks:
     weekly = compute_indicators(weekly)
     results = []
 
-    stock_return = compute_period_return(weekly["close"])
-
-    # Sector-index-based volume-weighted RS — fetched once per unique benchmark ticker and cached,
-    # so 752 symbols across ~8 sector indices means ~8 extra fetches total, not 752.
-    # If a sector's dedicated index fails to fetch (Yahoo hiccup, delisted ticker, etc.), fall back
-    # to the broad-universe index rather than leaving every stock in that sector as "n/a" forever.
     sector = SECTOR_MAP.get(symbol)
     benchmark_ticker = SECTOR_BENCHMARK_MAP.get(sector, FALLBACK_SECTOR_INDEX_TICKER)
 
-    if benchmark_ticker not in sector_cache:
-        sector_cache[benchmark_ticker] = _fetch_index_weekly(benchmark_ticker, period="5y")
-        if sector_cache[benchmark_ticker] is None:
-            print(f"  Warning: benchmark '{benchmark_ticker}' (sector: {sector}) failed to fetch — "
-                  f"falling back to {FALLBACK_SECTOR_INDEX_TICKER} for this sector.")
+    if benchmark_ticker not in sector_cache or sector_cache[benchmark_ticker] is None:
+        with _sector_cache_lock:
+            if benchmark_ticker not in sector_cache or sector_cache[benchmark_ticker] is None:
+                sector_cache[benchmark_ticker] = _fetch_index_weekly(benchmark_ticker, period="5y")
 
     benchmark_weekly = sector_cache.get(benchmark_ticker)
-
-    if benchmark_weekly is None and benchmark_ticker != FALLBACK_SECTOR_INDEX_TICKER:
-        if FALLBACK_SECTOR_INDEX_TICKER not in sector_cache:
-            sector_cache[FALLBACK_SECTOR_INDEX_TICKER] = _fetch_index_weekly(FALLBACK_SECTOR_INDEX_TICKER, period="5y")
+    if benchmark_weekly is None:
         benchmark_weekly = sector_cache.get(FALLBACK_SECTOR_INDEX_TICKER)
 
-    vw_rs = compute_volume_weighted_rs(weekly, benchmark_weekly)
+    vw_rs_sector = compute_volume_weighted_rs(weekly, benchmark_weekly, symbol=symbol)
+    vw_rs_market = compute_volume_weighted_rs(weekly, market_weekly, symbol=symbol)
 
-    if backtest:
-        start_idx = max(1, len(weekly) - lookback_weeks)
-        for i in range(start_idx, len(weekly)):
-            r = check_row(weekly, i)
-            if r:
-                r.symbol = symbol
-                r.sector = sector
-                r.rs_vs_sector_pct = vw_rs
-                results.append(r)
-    else:
-        r = check_row(weekly, len(weekly) - 1)
-        if r:
-            r.symbol = symbol
-            r.sector = sector
-            r.rs_vs_sector_pct = vw_rs
-            results.append(r)
+    r, checks = check_row_with_reasons(weekly, len(weekly) - 1, market_stage2)
+    if gate_counter is not None and checks is not None:
+        with _gate_counter_lock:
+            gate_counter["_total_scanned"] = gate_counter.get("_total_scanned", 0) + 1
+            for check_name, (passed, _) in checks.items():
+                if not passed:
+                    gate_counter[check_name] = gate_counter.get(check_name, 0) + 1
+    if r:
+        r.symbol = symbol
+        r.sector = sector
+        r.rs_vs_sector_pct = vw_rs_sector
+        r.rs_vs_market_pct = vw_rs_market
+        results.append(r)
 
-    return results, stock_return
+    return results, vw_rs_market
 
 
-# ---------------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------------
-
-TELEGRAM_MAX_CHARS = 4000  # Telegram's hard limit is 4096; leave headroom
-
+TELEGRAM_MAX_CHARS = 4000
 
 def _split_message_into_chunks(text: str, max_chars: int = TELEGRAM_MAX_CHARS) -> List[str]:
-    """Split a long message into chunks that fit Telegram's per-message limit,
-    breaking on blank lines between entries so a stock's block never gets cut in half."""
     if len(text) <= max_chars:
         return [text]
-
     blocks = text.split("\n\n")
-    chunks = []
-    current = ""
+    chunks, current = [], ""
     for block in blocks:
         candidate = (current + "\n\n" + block) if current else block
         if len(candidate) > max_chars and current:
@@ -739,39 +877,28 @@ def _split_message_into_chunks(text: str, max_chars: int = TELEGRAM_MAX_CHARS) -
 
 def send_telegram_message(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials not set (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — skipping send.")
+        print("Telegram credentials not set — skipping send.")
         print(text)
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     chunks = _split_message_into_chunks(text)
-    if len(chunks) > 1:
-        print(f"Message is {len(text)} chars — splitting into {len(chunks)} Telegram messages.")
-
     for i, chunk in enumerate(chunks, 1):
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
         try:
             resp = requests.post(url, data=payload, timeout=10)
             if resp.status_code == 400:
-                print(f"Markdown parse issue on chunk {i} — retrying as plain text.")
                 payload.pop("parse_mode", None)
                 resp = requests.post(url, data=payload, timeout=10)
             resp.raise_for_status()
-            print(f"Telegram chunk {i}/{len(chunks)} sent OK.")
         except Exception as e:
-            body = getattr(e, "response", None)
-            body_text = body.text if body is not None else ""
-            print(f"Telegram send failed on chunk {i}/{len(chunks)}: {e} {body_text}")
+            print(f"Telegram send failed on chunk {i}: {e}")
 
 
-def format_results_message(results: List[ScanResult]) -> str:
-    if not results:
-        return "*Near 10W/20W EMA Scan*\nNo matches this week."
-
-    high_conviction = [r for r in results if r.monthly_confirmed]
-    tactical = [r for r in results if not r.monthly_confirmed]
-
+def format_results_message(buy_setups: List[ScanResult], watchlist: List[ScanResult],
+                           market_stage_detail: str, rs_cutoff: Optional[float],
+                           include_watchlist: bool) -> str:
     def _fmt_entry(r: ScanResult, star: bool) -> str:
+        dist_5 = abs(r.close - r.ema5) / r.close * 100
         dist_10 = abs(r.close - r.ema10) / r.close * 100
         dist_20 = abs(r.close - r.ema20) / r.close * 100
         rsi_txt = f"{r.rsi14:.1f}" if r.rsi14 is not None else "n/a"
@@ -780,157 +907,126 @@ def format_results_message(results: List[ScanResult]) -> str:
         rs_sec = f"{r.rs_vs_sector_pct:+.1f}%" if r.rs_vs_sector_pct is not None else "n/a"
         sector_txt = f" [{r.sector}]" if r.sector else ""
         prefix = "⭐" if star else "•"
+
+        off_high_txt = f"{r.dist_from_52w_high_pct:.1f}% off 52W high" if r.dist_from_52w_high_pct is not None else "52W high n/a"
+        base_txt = f"{r.base_weeks}w base" if r.base_weeks is not None else "base n/a"
+        tightness_txt = r.tightness_label or "n/a"
+        sl_txt = f"SL: ₹{r.stop_loss} ({r.risk_pct}% risk)" if r.stop_loss is not None else "SL n/a"
+
+        vol_bits = []
+        if r.breakout_vol_ratio is not None:
+            if r.breakout_vol_ratio >= HIGH_VOL_BREAKOUT_RATIO:
+                vol_bits.append(f"🔊 {r.breakout_vol_ratio}x avg vol")
+            else:
+                vol_bits.append(f"vol {r.breakout_vol_ratio}x avg")
+        if r.vol_contracting is True:
+            vol_bits.append("contracted into base")
+        vol_txt = " | ".join(vol_bits) if vol_bits else "vol profile n/a"
+
+        threats_txt = f"\n  ⚠️ *Threats:* {', '.join(r.threats)}" if r.threats else ""
+
         return (
-            f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}\n"
-            f"  Close: {r.close} | EMA10: {r.ema10} | EMA20: {r.ema20} | EMA40: {r.ema40}\n"
-            f"  Dist to EMA10: {dist_10:.2f}% | Dist to EMA20: {dist_20:.2f}%\n"
+            f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}{' ✅ *BUY SETUP*' if r.buy_tag else ''}\n"
+            f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20}\n"
+            f"  Dist: 5W={dist_5:.1f}% | 10W={dist_10:.1f}% | 20W={dist_20:.1f}% | Spread: {r.ema_spread_pct:.2f}%\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
-            f"  RS vs Nifty50: {rs_mkt} | RS vs Sector: {rs_sec}\n"
+            f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
+            f"  {off_high_txt} | {base_txt} ({tightness_txt})\n"
+            f"  🎯 *{sl_txt}* | {vol_txt}{threats_txt}\n"
         )
 
-    lines = [f"*Near 10W/20W EMA Scan* — {len(results)} match(es)\n"]
+    lines = [f"*EMA Squeeze Base Scanner*"]
+    lines.append(f"Market: {market_stage_detail}")
+    if rs_cutoff is not None:
+        lines.append(f"RS gate: top {100 - RS_PERCENTILE_MIN:.0f}% of universe (vw-RS >= {rs_cutoff:+.1f})")
+    lines.append("")
 
-    if high_conviction:
-        lines.append(f"🔥 *High-Conviction (Weekly + Monthly Confluence)* — {len(high_conviction)}\n")
-        for r in high_conviction:
+    if buy_setups:
+        lines.append(f"✅ *BUY SETUPS* — {len(buy_setups)} (all gates + volume-confirmed)\n")
+        for r in buy_setups:
             lines.append(_fmt_entry(r, star=True))
+    else:
+        lines.append("✅ *BUY SETUPS* — none this week.\n")
 
-    if tactical:
-        lines.append(f"📊 *Tactical (Weekly Setup Only)* — {len(tactical)}\n")
-        for r in tactical:
-            lines.append(_fmt_entry(r, star=False))
+    if include_watchlist:
+        if watchlist:
+            lines.append(f"👀 *Watchlist* (passed base compression & risk floor — {len(watchlist)})\n")
+            for r in watchlist:
+                lines.append(_fmt_entry(r, star=False))
+        else:
+            lines.append("👀 *Watchlist* — empty.\n")
 
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def explain_symbol(symbol: str):
-    """Print a pass/fail breakdown of every condition for the latest week of one symbol."""
-    daily = fetch_daily_ohlc(symbol)
-    if daily is None:
-        print(f"{symbol}: could not fetch data.")
-        return
-
-    weekly = build_weekly(daily)
-    if weekly is None:
-        print(f"{symbol}: not enough weekly bars.")
-        return
-
-    monthly_trend = build_monthly_trend(daily)
-    weekly = attach_monthly_trend(weekly, monthly_trend)
-    weekly = compute_indicators(weekly)
-
-    evald = evaluate_conditions(weekly, len(weekly) - 1)
-    if evald is None:
-        print(f"{symbol}: not enough history to evaluate yet.")
-        return
-
-    row = evald["row"]
-    checks = evald["checks"]
-    sector = SECTOR_MAP.get(symbol)
-    benchmark_ticker = SECTOR_BENCHMARK_MAP.get(sector, FALLBACK_SECTOR_INDEX_TICKER)
-    benchmark_weekly = _fetch_index_weekly(benchmark_ticker, period="5y")
-    vw_rs = compute_volume_weighted_rs(weekly, benchmark_weekly)
-
-    print(f"\n=== {symbol} ({sector}) — week of {row.name.date()} — close {row.close:.2f} ===")
-    all_pass = True
-    for name, (passed, detail) in checks.items():
-        mark = "PASS" if passed else "FAIL"
-        if not passed:
-            all_pass = False
-        print(f"  [{mark}] {name}: {detail}")
-    print(f"  [INFO] monthly_confirmed (bonus, not gating): {evald['monthly_confirmed']}")
-    print(f"  [INFO] VW-RS vs {benchmark_ticker}: {vw_rs}")
-    print(f"  => OVERALL: {'MATCH' if all_pass else 'no match'}\n")
-
-
 def main():
     parser = argparse.ArgumentParser(description="EMA Squeeze Base weekly scanner")
-    parser.add_argument("--dry-run", action="store_true", help="Print results, skip Telegram send")
-    parser.add_argument("--backtest", action="store_true", help="Check the last N weeks instead of just the latest")
-    parser.add_argument("--lookback-weeks", type=int, default=5, help="Weeks to check when --backtest is set")
-    parser.add_argument("--delay", type=float, default=0.5, help="Seconds to sleep between symbol downloads")
-    parser.add_argument("--limit", type=int, default=None, help="Only scan the first N symbols (useful for quick tests)")
-    parser.add_argument("--explain", type=str, default=None,
-                         help="Show a per-condition pass/fail breakdown for one symbol (e.g. --explain ZYDUSLIFE) instead of scanning")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--backtest", action="store_true")
+    parser.add_argument("--lookback-weeks", type=int, default=5)
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--gate-debug", action="store_true")
+    parser.add_argument("--include-watchlist", action="store_true", default=True)
     args = parser.parse_args()
 
-    if args.explain:
-        explain_symbol(args.explain.upper())
-        return
+    market_weekly = _fetch_index_weekly(MARKET_INDEX_TICKER, period="5y")
+    stage_info = compute_market_stage(market_weekly)
+    market_stage2_effective = stage_info["stage2"] or not REQUIRE_MARKET_STAGE2
+    print(f"[MARKET] {stage_info['detail']} -> stage2={stage_info['stage2']}")
 
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
-    print(f"Scanning {len(symbols)} symbols...")
+    print(f"Scanning {len(symbols)} symbols with {args.workers} parallel workers...")
 
-    market_weekly = _fetch_index_weekly(MARKET_INDEX_TICKER)
-    market_return = compute_period_return(market_weekly["close"]) if market_weekly is not None else None
-    if market_return is None:
-        print("Warning: could not fetch Nifty 50 benchmark — RS vs market will show as n/a.")
+    all_candidates: List[ScanResult] = []
+    rs_pool: List[float] = []
+    sector_cache: dict = {}
+    gate_counter: dict = {} if args.gate_debug else None
 
-    all_results: List[ScanResult] = []
-    sector_cache: dict = {}      # benchmark ticker -> weekly df, reused across all symbols in that sector
-    stock_return_map: dict = {}  # symbol -> its own latest return, so matches can look theirs up below
-    all_vw_rs_values: List[float] = []  # EVERY symbol's VW-RS (matched or not) — for the distribution report
+    prefetch_sector_benchmarks(symbols, sector_cache)
 
-    for i, symbol in enumerate(symbols, 1):
-        print(f"[{i}/{len(symbols)}] {symbol}")
-        results, stock_return = scan_symbol(symbol, sector_cache, backtest=args.backtest, lookback_weeks=args.lookback_weeks)
-        all_results.extend(results)
-        if stock_return is not None:
-            stock_return_map[symbol] = stock_return
-        time.sleep(args.delay)
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_symbol = {
+            executor.submit(
+                scan_symbol, symbol, sector_cache, market_weekly, args.backtest, args.lookback_weeks,
+                market_stage2_effective, gate_counter,
+            ): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            try:
+                results, rs_value = future.result()
+            except Exception:
+                continue
+            if rs_value is not None:
+                rs_pool.append(rs_value)
+            all_candidates.extend(results)
 
-    # Annotate every match with RS vs market.
-    # NOTE: this uses each symbol's CURRENT (latest week) return even in --backtest mode, so RS values
-    # attached to older backtest weeks are only approximate context, not point-in-time-accurate.
-    all_market_rs_values: List[float] = []
-    for r in all_results:
-        sr = stock_return_map.get(r.symbol)
-        if sr is not None and market_return is not None:
-            r.rs_vs_market_pct = round(sr - market_return, 2)
-            all_market_rs_values.append(r.rs_vs_market_pct)
-        if r.rs_vs_sector_pct is not None:
-            all_vw_rs_values.append(r.rs_vs_sector_pct)
+    if gate_counter is not None:
+        total = gate_counter.pop("_total_scanned", 0)
+        print(f"\nGATE FAILURE HISTOGRAM (out of {total} symbols)")
+        for check_name, fail_count in sorted(gate_counter.items(), key=lambda x: -x[1]):
+            pct = round(fail_count / total * 100, 1) if total > 0 else 0.0
+            print(f"  {check_name}: failed for {fail_count}/{total} ({pct}%)")
 
-    def _print_distribution(label: str, values: List[float], const_names: str):
-        if not values:
-            print(f"\nNo {label} values computed this run — can't report a distribution yet.\n")
-            return
-        s = pd.Series(values)
-        print("\n" + "=" * 60)
-        print(f"{label} DISTRIBUTION (from {len(values)} matched stocks this run)")
-        print(f"  min={s.min():.2f}  p25={s.quantile(.25):.2f}  median={s.median():.2f}  "
-              f"p75={s.quantile(.75):.2f}  p90={s.quantile(.90):.2f}  max={s.max():.2f}")
-        print(f"Use these numbers to set {const_names}.")
-        print("=" * 60 + "\n")
+    rs_cutoff = None
+    if rs_pool:
+        rs_cutoff = float(np.percentile(rs_pool, RS_PERCENTILE_MIN))
+        all_candidates = [
+            r for r in all_candidates
+            if r.rs_vs_market_pct is not None and r.rs_vs_market_pct >= rs_cutoff
+        ]
+        print(f"[RS] universe n={len(rs_pool)} | top-{100 - RS_PERCENTILE_MIN:.0f}% cutoff = {rs_cutoff:+.2f}")
 
-    _print_distribution("VW-RS (sector)", all_vw_rs_values, "RS_VS_SECTOR_MIN/MAX")
-    _print_distribution("RS vs market", all_market_rs_values, "RS_VS_MARKET_MIN/MAX")
+    buy_setups = [r for r in all_candidates if r.buy_tag]
+    watchlist = [r for r in all_candidates if not r.buy_tag]
 
-    before_gate = len(all_results)
-    if REQUIRE_RS_GATE:
-        def _in_sweet_spot(r: ScanResult) -> bool:
-            # If RS couldn't be computed for a stock (data gap), don't silently drop it —
-            # only gate on RS when we actually have the numbers.
-            mkt_ok = (r.rs_vs_market_pct is None) or (RS_VS_MARKET_MIN <= r.rs_vs_market_pct <= RS_VS_MARKET_MAX)
-            sec_ok = (r.rs_vs_sector_pct is None) or (RS_VS_SECTOR_MIN <= r.rs_vs_sector_pct <= RS_VS_SECTOR_MAX)
-            return mkt_ok and sec_ok
-
-        all_results = [r for r in all_results if _in_sweet_spot(r)]
-        dropped = before_gate - len(all_results)
-        if dropped:
-            print(f"RS sweet-spot filter: dropped {dropped} match(es) outside "
-                  f"[{RS_VS_MARKET_MIN}%, {RS_VS_MARKET_MAX}%] vs market / "
-                  f"[{RS_VS_SECTOR_MIN}%, {RS_VS_SECTOR_MAX}%] vs sector.")
-
-    print(f"\n{len(all_results)} match(es) found.")
-    message = format_results_message(all_results)
+    print(f"\n{len(buy_setups)} BUY SETUP(s), {len(watchlist)} watchlist candidate(s).")
+    message = format_results_message(buy_setups, watchlist, stage_info["detail"], rs_cutoff, args.include_watchlist)
     print(message)
 
-    if not args.dry_run:
+    if not args.dry_run and not args.backtest:
         send_telegram_message(message)
 
 
