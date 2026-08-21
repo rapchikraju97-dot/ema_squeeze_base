@@ -83,3 +83,10 @@ scan_run_date,symbol,sector,week_date,close_at_match,ema10_at_match,rs_vs_sector
 2026-08-18,WELSPUNLIV,Textiles,2026-08-14,164.06,158.69,54.47,False,
 2026-08-18,ZYDUSWELL,Fast Moving Consumer Goods,2026-08-14,510.3,539.39,75.64,False,
 2026-08-18,JINDALSAW,Capital Goods,2026-08-14,267.1,259.0,20.32,False,False
+2026-08-21,ASIANPAINT,Consumer Durables,2026-08-21,2640.0,2672.63,0.87,False,False
+2026-08-21,HOMEFIRST,Financial Services,2026-08-21,1193.7,1178.96,7.99,False,False
+2026-08-21,JSWSTEEL,Metals & Mining,2026-08-21,1293.7,1266.78,1.55,True,False
+2026-08-21,NMDC,Metals & Mining,2026-08-21,84.61,85.18,3.09,True,False
+2026-08-21,TITAGARH,Capital Goods,2026-08-21,843.55,837.44,5.7,False,False
+2026-08-21,V2RETAIL,Consumer Services,2026-08-21,219.73,220.52,5.39,True,False
+2026-08-21,YESBANK,Financial Services,2026-08-21,22.8,22.99,5.91,True,False
