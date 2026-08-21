@@ -2,21 +2,15 @@ name: EMA Squeeze Base Weekly Scan
 
 on:
   schedule:
-    # Friday, 18:00 IST = 12:30 UTC
-    - cron: '30 12 * * 5'
-  workflow_dispatch:
-    inputs:
-      extra_flags:
-        description: 'Extra CLI flags'
-        required: false
-        default: '--gate-debug --include-watchlist --dry-run'
+    # Monday + Friday, 18:00 IST = 12:30 UTC
+    - cron: '30 12 * * 1,5'
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab too
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
+    timeout-minutes: 30   # 752 symbols with a 0.5s delay + downloads can take a while
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,20 +22,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install yfinance pandas numpy ta requests
+          pip install --upgrade pip
+          pip install yfinance pandas ta requests
 
       - name: Run scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python ema_squeeze_base_v2.py --gate-debug --include-watchlist ${{ github.event.inputs.extra_flags }}
-
-      - name: Commit match history
-        run: |
-          git config user.email "bot@rkscanbot"
-          git config user.name "RKScanBot"
-          git add match_history.csv
-          git commit -m "Log matches $(date +%F)" || echo "Nothing to commit"
-          git push
+          python ema_squeeze_base.py
