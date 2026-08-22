@@ -141,6 +141,7 @@ MATCH_HISTORY_CSV = "match_history.csv"
 MATCH_HISTORY_FIELDS = [
     "scan_run_date", "symbol", "sector", "week_date", "close_at_match",
     "ema10_at_match", "rs_vs_sector_at_match", "monthly_confirmed", "buy_tag",
+    "pullback_ema", "stop_loss_at_match", "risk_pct_at_match",
 ]
 DEFAULT_REPORT_LOOKBACK_WEEKS = 8
 
@@ -478,6 +479,7 @@ class ScanResult:
     stop_loss: Optional[float] = None
     risk_pct: Optional[float] = None
     threats: List[str] = field(default_factory=list)
+    pullback_ema: Optional[str] = None  # "5W" / "10W" / "20W" — which EMA is being bought at, see note below
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +822,16 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     near_ema20 = dist_ema20 <= NEAR_EMA_PCT
     near_any = near_ema5 or near_ema10 or near_ema20
 
+    # RK's stated rule treats "pullback to 10W" and "pullback to 20W" as one
+    # combined trigger — but they're different setups (tighter/stronger vs.
+    # deeper/weaker pullback). Classify by whichever EMA is CLOSEST to close,
+    # so the two can be tracked and backtested separately rather than pooled
+    # into one undifferentiated bucket. 5W is kept as its own aggressive/tight
+    # bucket rather than folded into "10W".
+    ema_dists = {"5W": dist_ema5, "10W": dist_ema10, "20W": dist_ema20}
+    near_dists = {k: v for k, v in ema_dists.items() if v <= NEAR_EMA_PCT}
+    pullback_ema = min(near_dists, key=near_dists.get) if near_dists else None
+
     ema_spread_pct = (max(row.ema5, row.ema10, row.ema20) - min(row.ema5, row.ema10, row.ema20)) / row.close * 100
     squeeze_ok = ema_spread_pct <= EMA_SPREAD_MAX_PCT
 
@@ -891,7 +903,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
         "dist_from_52w_high_pct": dist_from_52w_high_pct, "base_weeks": base_weeks,
         "breakout_vol_ratio": breakout_vol_ratio, "vol_contracting": vol_contracting,
         "ema_spread_pct": ema_spread_pct, "stop_loss": stop_loss, "risk_pct": risk_pct,
-        "adx_rising": adx_rising_ok,
+        "adx_rising": adx_rising_ok, "pullback_ema": pullback_ema,
     }
 
 
@@ -954,6 +966,7 @@ def _build_scan_result(evald: dict, df: pd.DataFrame, idx: int, market_stage2: b
         stop_loss=stop_loss,
         risk_pct=risk_pct,
         threats=threats,
+        pullback_ema=evald.get("pullback_ema"),
     )
 
 
@@ -1136,6 +1149,27 @@ def compute_backtest_r_stats(results: List[ScanResult], weekly_cache: dict, forw
     }
 
 
+def compute_backtest_r_stats_by_pullback(results: List[ScanResult], weekly_cache: dict,
+                                          forward_weeks: int = 8) -> dict:
+    """
+    Splits backtest results by which EMA the pullback was measured against
+    (5W / 10W / 20W) and runs compute_backtest_r_stats separately on each
+    cohort. This is the actual test of whether "buy the 10W or 20W EMA" is
+    one edge or two different ones — pooling them, as the original stated
+    rule did, hides that distinction entirely.
+    """
+    groups: dict = {"5W": [], "10W": [], "20W": [], "unclassified": []}
+    for r in results:
+        key = r.pullback_ema if r.pullback_ema in groups else "unclassified"
+        groups[key].append(r)
+
+    return {
+        label: compute_backtest_r_stats(group_results, weekly_cache, forward_weeks=forward_weeks)
+        for label, group_results in groups.items()
+        if group_results
+    }
+
+
 # ---------------------------------------------------------------------------
 # Telegram & Formatting
 # ---------------------------------------------------------------------------
@@ -1199,6 +1233,7 @@ def format_results_message(buy_setups: List[ScanResult], watchlist: List[ScanRes
         off_high_txt = f"{r.dist_from_52w_high_pct:.1f}% off 52W high" if r.dist_from_52w_high_pct is not None else "52W high n/a"
         base_txt = f"{r.base_weeks}w base" if r.base_weeks is not None else "base n/a"
         tightness_txt = r.tightness_label or "n/a"
+        pullback_txt = f"Pullback: {r.pullback_ema} EMA" if r.pullback_ema else "Pullback: n/a"
         sl_txt = f"SL: ₹{r.stop_loss} ({r.risk_pct}% risk)" if r.stop_loss is not None else "SL n/a"
 
         vol_bits = []
@@ -1216,14 +1251,14 @@ def format_results_message(buy_setups: List[ScanResult], watchlist: List[ScanRes
         return (
             f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}{' ✅ *BUY SETUP*' if r.buy_tag else ''}\n"
             f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20}\n"
-            f"  Dist: 5W={dist_5:.1f}% | 10W={dist_10:.1f}% | 20W={dist_20:.1f}% | EMA spread: {r.ema_spread_pct:.2f}%\n"
+            f"  Dist: 5W={dist_5:.1f}% | 10W={dist_10:.1f}% | 20W={dist_20:.1f}% | EMA spread: {r.ema_spread_pct:.2f}% | {pullback_txt}\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
             f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
             f"  {off_high_txt} | {base_txt} ({tightness_txt})\n"
             f"  🎯 *{sl_txt}* | {vol_txt}{threats_txt}\n"
         )
 
-    lines = [f"*EMA Squeeze Scan v2*"]
+    lines = [f"*EMA Squeeze Scan v3*"]
     lines.append(f"Market: {market_stage_detail}")
     if rs_cutoff is not None:
         lines.append(f"RS gate: top {100 - RS_PERCENTILE_MIN:.0f}% of universe (vw-RS >= {rs_cutoff:+.1f})")
@@ -1291,6 +1326,9 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
             "rs_vs_sector_at_match": r.rs_vs_sector_pct if r.rs_vs_sector_pct is not None else "",
             "monthly_confirmed": r.monthly_confirmed,
             "buy_tag": r.buy_tag,
+            "pullback_ema": r.pullback_ema or "",
+            "stop_loss_at_match": r.stop_loss if r.stop_loss is not None else "",
+            "risk_pct_at_match": r.risk_pct if r.risk_pct is not None else "",
         })
 
     if not new_rows:
@@ -1538,7 +1576,7 @@ def main():
 
     if args.backtest:
         stats = compute_backtest_r_stats(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
-        print("\n=== BACKTEST R-MULTIPLE STATS (weekly-close approximation) ===")
+        print("\n=== BACKTEST R-MULTIPLE STATS — OVERALL (weekly-close approximation) ===")
         if stats.get("n", 0) == 0:
             print("  No trackable matches (need forward weekly bars after the match date).")
         else:
@@ -1547,6 +1585,21 @@ def main():
             print(f"  Avg R: {stats['avg_r']:+.2f}")
             print(f"  Avg win R: {stats['avg_win_r']:+.2f} | Avg loss R: {stats['avg_loss_r']:+.2f}")
             print(f"  Expectancy per trade: {stats['expectancy_r']:+.2f}R")
+
+        by_group = compute_backtest_r_stats_by_pullback(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
+        print("\n=== BACKTEST R-MULTIPLE STATS — BY PULLBACK EMA (10W vs 20W vs 5W) ===")
+        if not by_group:
+            print("  No trackable matches.")
+        else:
+            for label, gstats in by_group.items():
+                if gstats.get("n", 0) == 0:
+                    print(f"  [{label}] no trackable matches")
+                    continue
+                print(f"  [{label}] n={gstats['n']} | win rate {gstats['win_rate_pct']}% | "
+                      f"avg R {gstats['avg_r']:+.2f} | expectancy {gstats['expectancy_r']:+.2f}R")
+            print("  (If 10W and 20W expectancy diverge meaningfully, that confirms they're "
+                  "two different setups and should be tracked/sized separately going forward — "
+                  "not evidence either one is wrong on its own.)")
 
     to_log = [r for r in buy_setups]
     if to_log and not args.backtest and not args.no_log_history:
