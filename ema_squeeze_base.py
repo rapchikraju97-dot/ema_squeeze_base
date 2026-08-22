@@ -134,6 +134,9 @@ PULLBACK_RSI_MIN = 50.0             # RSI must hold above this — trend structu
 PULLBACK_VOL_LOOKBACK_WEEKS = 4     # trailing window used to judge "volume drying up into the pullback"
 PULLBACK_VOL_CONTRACTION_RATIO = 1.0  # this week's volume must be <= this x the trailing average (i.e. quiet)
 PULLBACK_STOP_LOOKBACK_WEEKS = 4    # swing-low lookback for stop placement (no formed "base" to use here)
+SUPPORT_CLOSE_TOLERANCE_PCT = 0.3   # v3 fix: close must be at/above the EMA (within this tiny buffer) to
+                                     # count as "support held" — a close BELOW the EMA is a broken support,
+                                     # not a valid pullback-buy, even if the % distance looks small.
 
 # --- Other threat annotations (informational only, not gates) ---
 THREAT_DIST_52W_HIGH_PCT = 18.0
@@ -843,8 +846,15 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     # so the two can be tracked and backtested separately rather than pooled
     # into one undifferentiated bucket. 5W is kept as its own aggressive/tight
     # bucket rather than folded into "10W".
+    # Direction matters here too (see the fuller fix + comment in
+    # evaluate_pullback_continuation) — a close below an EMA isn't "support,"
+    # so it's excluded from the classification even if it's numerically close.
+    ema_map = {"5W": row.ema5, "10W": row.ema10, "20W": row.ema20}
     ema_dists = {"5W": dist_ema5, "10W": dist_ema10, "20W": dist_ema20}
-    near_dists = {k: v for k, v in ema_dists.items() if v <= NEAR_EMA_PCT}
+    near_dists = {
+        k: v for k, v in ema_dists.items()
+        if v <= NEAR_EMA_PCT and row.close >= ema_map[k] * (1 - SUPPORT_CLOSE_TOLERANCE_PCT / 100)
+    }
     pullback_ema = min(near_dists, key=near_dists.get) if near_dists else None
 
     ema_spread_pct = (max(row.ema5, row.ema10, row.ema20) - min(row.ema5, row.ema10, row.ema20)) / row.close * 100
@@ -1030,10 +1040,21 @@ def evaluate_pullback_continuation(df: pd.DataFrame, idx: int) -> Optional[dict]
 
     # Only a 10W or 20W touch counts as "the pullback" for this rule — a 5W
     # touch alone is just noise inside an active uptrend, not a real pullback.
+    # CRITICAL: proximity alone isn't enough. "Found support at the EMA" means
+    # close is AT OR ABOVE the line (or within a tiny noise tolerance below
+    # it) — not just "close happens to be within 3% of the EMA regardless of
+    # direction." A close that's slipped below the EMA is a broken support,
+    # not a held one, even if the % distance looks small. (Caught on CCL:
+    # close 1112.4 was BELOW ema5/ema10/ema20 all three — near by distance,
+    # but not "support" in any real sense — the old distance-only check
+    # would have still tagged it.)
+    support_ok_10w = row.close >= row.ema10 * (1 - SUPPORT_CLOSE_TOLERANCE_PCT / 100)
+    support_ok_20w = row.close >= row.ema20 * (1 - SUPPORT_CLOSE_TOLERANCE_PCT / 100)
+
     pullback_candidates = {}
-    if dist_ema10 <= NEAR_EMA_PCT:
+    if dist_ema10 <= NEAR_EMA_PCT and support_ok_10w:
         pullback_candidates["10W"] = dist_ema10
-    if dist_ema20 <= NEAR_EMA_PCT:
+    if dist_ema20 <= NEAR_EMA_PCT and support_ok_20w:
         pullback_candidates["20W"] = dist_ema20
     pullback_ema = min(pullback_candidates, key=pullback_candidates.get) if pullback_candidates else None
     near_10_or_20 = pullback_ema is not None
@@ -1086,7 +1107,9 @@ def evaluate_pullback_continuation(df: pd.DataFrame, idx: int) -> Optional[dict]
 
     checks = {
         "near_10w_or_20w_ema": (near_10_or_20,
-            f"dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to either)"),
+            f"close {row.close:.2f} vs EMA10 {row.ema10:.2f} (dist {dist_ema10*100:.2f}%, support held: {support_ok_10w}) | "
+            f"EMA20 {row.ema20:.2f} (dist {dist_ema20*100:.2f}%, support held: {support_ok_20w}) "
+            f"(need <= {NEAR_EMA_PCT*100:.0f}% AND close at/above the EMA)"),
         "uptrend": (uptrend_ok,
             f"ema10 {row.ema10:.2f} > ema20 {row.ema20:.2f} > ema40 {row.ema40:.2f} (sloping up), close {row.close:.2f} > ema40: {uptrend_ok}"),
         "adx_floor": (adx_ok,
