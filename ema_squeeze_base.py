@@ -1777,4 +1777,60 @@ def main():
             rs_ok = r.rs_vs_market_pct is not None and r.rs_vs_market_pct >= rs_cutoff
             if not rs_ok and r.buy_tag:
                 r.buy_tag = False
-                r.threats.append(f"RS below top-{100 - RS_PERCENTILE_MIN:.0f}% cutoff ({
+                r.threats.append(f"RS below top-{100 - RS_PERCENTILE_MIN:.0f}% cutoff ({rs_cutoff:+.1f})")
+        print(f"[RS] universe n={len(rs_pool)} | top-{100 - RS_PERCENTILE_MIN:.0f}% cutoff = {rs_cutoff:+.2f}")
+    else:
+        print("[RS] no RS values computed — RS gate skipped this run")
+
+    buy_setups = [r for r in all_candidates if r.buy_tag]
+    watchlist = [r for r in all_candidates if not r.buy_tag]
+
+    print(f"\n{len(buy_setups)} BUY SETUP(s), {len(watchlist)} watchlist candidate(s) after RS percentile gate.")
+
+    message = format_results_message(
+        buy_setups, watchlist, stage_info["detail"], rs_cutoff, args.include_watchlist
+    )
+    print(message)
+
+    if args.backtest:
+        stats = compute_backtest_r_stats(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
+        print("\n=== BACKTEST R-MULTIPLE STATS — OVERALL (weekly-close approximation) ===")
+        if stats.get("n", 0) == 0:
+            print("  No trackable matches (need forward weekly bars after the match date).")
+        else:
+            print(f"  n = {stats['n']}")
+            print(f"  Win rate: {stats['win_rate_pct']}%")
+            print(f"  Avg R: {stats['avg_r']:+.2f}")
+            print(f"  Avg win R: {stats['avg_win_r']:+.2f} | Avg loss R: {stats['avg_loss_r']:+.2f}")
+            print(f"  Expectancy per trade: {stats['expectancy_r']:+.2f}R")
+
+        by_group = compute_backtest_r_stats_by_pullback(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
+        print("\n=== BACKTEST R-MULTIPLE STATS — BY PULLBACK EMA (10W vs 20W vs 5W) ===")
+        if not by_group:
+            print("  No trackable matches.")
+        else:
+            for label, gstats in by_group.items():
+                if gstats.get("n", 0) == 0:
+                    print(f"  [{label}] no trackable matches")
+                    continue
+                print(f"  [{label}] n={gstats['n']} | win rate {gstats['win_rate_pct']}% | "
+                      f"avg R {gstats['avg_r']:+.2f} | expectancy {gstats['expectancy_r']:+.2f}R")
+            print("  (If 10W and 20W expectancy diverge meaningfully, that confirms they're "
+                  "two different setups and should be tracked/sized separately going forward — "
+                  "not evidence either one is wrong on its own.)")
+
+    to_log = [r for r in buy_setups]
+    if to_log and not args.backtest and not args.no_log_history:
+        log_matches_to_history(to_log)
+
+    if args.with_weekly_report:
+        report = generate_weekly_report(lookback_weeks=args.report_lookback_weeks, workers=args.workers)
+        print("\n" + report)
+        message = message + "\n\n" + ("─" * 20) + "\n\n" + report
+
+    if not args.dry_run and not args.backtest:
+        send_telegram_message(message)
+
+
+if __name__ == "__main__":
+    main()
