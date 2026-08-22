@@ -122,6 +122,19 @@ RS_PERCENTILE_MIN = 60.0   # v3: eased 70 -> 60 — top 40% of the scanned unive
 # strict enforcement with --require-market-stage if you want it back as a gate. ---
 REQUIRE_MARKET_STAGE2 = False
 
+# --- RULE 2: EMA Pullback Continuation (Qullamaggie-style) ---
+# Deliberately separate from the squeeze/VCP rule above. A strong uptrend with
+# ONE clean pullback to the 10W or 20W EMA is a different, faster setup than
+# multi-week compression — forcing it through the squeeze rule's
+# min_base_duration / ema_squeeze gates rejects it, because one sharp pullback
+# week resets the base-duration counter and the fast EMAs haven't re-converged
+# yet. This rule has its own, looser gates suited to that pattern.
+ENABLE_PULLBACK_RULE = True
+PULLBACK_RSI_MIN = 50.0             # RSI must hold above this — trend structure intact, not broken down
+PULLBACK_VOL_LOOKBACK_WEEKS = 4     # trailing window used to judge "volume drying up into the pullback"
+PULLBACK_VOL_CONTRACTION_RATIO = 1.0  # this week's volume must be <= this x the trailing average (i.e. quiet)
+PULLBACK_STOP_LOOKBACK_WEEKS = 4    # swing-low lookback for stop placement (no formed "base" to use here)
+
 # --- Other threat annotations (informational only, not gates) ---
 THREAT_DIST_52W_HIGH_PCT = 18.0
 THREAT_RSI_EXTENDED = 68
@@ -480,6 +493,8 @@ class ScanResult:
     risk_pct: Optional[float] = None
     threats: List[str] = field(default_factory=list)
     pullback_ema: Optional[str] = None  # "5W" / "10W" / "20W" — which EMA is being bought at, see note below
+    setup_type: str = "squeeze_base"    # "squeeze_base" (VCP-style, multi-week compression) or
+                                          # "pullback_continuation" (Qullamaggie-style, single clean pullback)
 
 
 # ---------------------------------------------------------------------------
@@ -967,6 +982,7 @@ def _build_scan_result(evald: dict, df: pd.DataFrame, idx: int, market_stage2: b
         risk_pct=risk_pct,
         threats=threats,
         pullback_ema=evald.get("pullback_ema"),
+        setup_type="squeeze_base",
     )
 
 
@@ -989,6 +1005,178 @@ def check_row_with_reasons(df: pd.DataFrame, idx: int, market_stage2: bool):
     return _build_scan_result(evald, df, idx, market_stage2), checks
 
 
+# ---------------------------------------------------------------------------
+# RULE 2: EMA Pullback Continuation (Qullamaggie-style)
+# ---------------------------------------------------------------------------
+
+def evaluate_pullback_continuation(df: pd.DataFrame, idx: int) -> Optional[dict]:
+    """
+    Strong uptrend + ONE clean pullback to the 10W or 20W EMA + volume drying
+    up into the pullback + RSI holding above 50. No multi-week compression
+    requirement — that's what makes this a different setup from
+    evaluate_conditions (the squeeze/VCP rule), not a looser version of it.
+    """
+    if idx < 1 or idx >= len(df):
+        return None
+
+    row = df.iloc[idx]
+    required = ["ema5", "ema10", "ema20", "ema40"]
+    if row[required].isna().any():
+        return None
+
+    dist_ema5 = abs(row.close - row.ema5) / row.close
+    dist_ema10 = abs(row.close - row.ema10) / row.close
+    dist_ema20 = abs(row.close - row.ema20) / row.close
+
+    # Only a 10W or 20W touch counts as "the pullback" for this rule — a 5W
+    # touch alone is just noise inside an active uptrend, not a real pullback.
+    pullback_candidates = {}
+    if dist_ema10 <= NEAR_EMA_PCT:
+        pullback_candidates["10W"] = dist_ema10
+    if dist_ema20 <= NEAR_EMA_PCT:
+        pullback_candidates["20W"] = dist_ema20
+    pullback_ema = min(pullback_candidates, key=pullback_candidates.get) if pullback_candidates else None
+    near_10_or_20 = pullback_ema is not None
+
+    ema40_sloping_up = True
+    if idx >= 4:
+        ema40_prev = df.iloc[idx - 4]["ema40"]
+        ema40_sloping_up = bool(row.ema40 >= ema40_prev)
+    uptrend_ok = bool(row.ema10 > row.ema20 > row.ema40 and row.close > row.ema40 and ema40_sloping_up)
+
+    adx_val = row.get("adx14", float("nan"))
+    adx_ok = bool(pd.notna(adx_val) and adx_val >= ADX_MIN)
+
+    rsi_val = row.get("rsi14", float("nan"))
+    rsi_ok = bool(pd.notna(rsi_val) and rsi_val >= PULLBACK_RSI_MIN)
+
+    high_52w = row.get("high_52w", float("nan"))
+    if pd.notna(high_52w) and high_52w > 0:
+        dist_from_52w_high_pct = round((high_52w - row.close) / high_52w * 100, 2)
+        near_52w_high_ok = dist_from_52w_high_pct <= MAX_PCT_OFF_52W_HIGH
+        pct_detail = f"{dist_from_52w_high_pct:.1f}% off 52W high (need <= {MAX_PCT_OFF_52W_HIGH:.0f}%)"
+    else:
+        dist_from_52w_high_pct = None
+        near_52w_high_ok = False
+        pct_detail = "52W high not available yet"
+
+    # Volume should be drying up INTO this week's pullback — the market
+    # showing no urgency to sell, not a breakdown in progress.
+    if idx - PULLBACK_VOL_LOOKBACK_WEEKS < 0:
+        vol_ratio_val = None
+        vol_contract_ok = False
+        vol_detail = "not enough volume history"
+    else:
+        trailing_vol = df["volume"].iloc[idx - PULLBACK_VOL_LOOKBACK_WEEKS: idx]
+        trailing_avg = trailing_vol.mean()
+        vol_ratio_val = round(float(row.volume / trailing_avg), 2) if trailing_avg > 0 else None
+        vol_contract_ok = bool(vol_ratio_val is not None and vol_ratio_val <= PULLBACK_VOL_CONTRACTION_RATIO)
+        vol_detail = (f"this week vol {vol_ratio_val}x trailing {PULLBACK_VOL_LOOKBACK_WEEKS}w avg "
+                      f"(need <= {PULLBACK_VOL_CONTRACTION_RATIO}x)") if vol_ratio_val is not None else "n/a"
+
+    # Stop placed below the recent swing low — there's no multi-week base to
+    # use for stop placement here, just the pullback's own low.
+    stop_lookback_start = max(0, idx - PULLBACK_STOP_LOOKBACK_WEEKS)
+    swing_low = df["low"].iloc[stop_lookback_start: idx + 1].min()
+    stop_loss = round(float(swing_low) * 0.99, 2)
+    risk_pct = round((row.close - stop_loss) / row.close * 100, 2)
+    risk_ok = risk_pct <= MAX_RISK_PCT
+
+    monthly_context_ok = bool(row.get("monthly_uptrend", False))
+
+    checks = {
+        "near_10w_or_20w_ema": (near_10_or_20,
+            f"dist to EMA10 {dist_ema10*100:.2f}% | dist to EMA20 {dist_ema20*100:.2f}% (need <= {NEAR_EMA_PCT*100:.0f}% to either)"),
+        "uptrend": (uptrend_ok,
+            f"ema10 {row.ema10:.2f} > ema20 {row.ema20:.2f} > ema40 {row.ema40:.2f} (sloping up), close {row.close:.2f} > ema40: {uptrend_ok}"),
+        "adx_floor": (adx_ok,
+            (f"ADX {adx_val:.1f} (need >= {ADX_MIN})" if pd.notna(adx_val) else "ADX not available")),
+        "rsi_holding_above_50": (rsi_ok,
+            (f"RSI {rsi_val:.1f} (need >= {PULLBACK_RSI_MIN:.0f})" if pd.notna(rsi_val) else "RSI not available")),
+        "near_52w_high": (near_52w_high_ok, pct_detail),
+        "volume_contracting_into_pullback": (vol_contract_ok, vol_detail),
+        "risk_within_max": (risk_ok,
+            f"stop {stop_loss} implies {risk_pct:.2f}% risk (need <= {MAX_RISK_PCT:.1f}%)"),
+        "monthly_trend_context": (monthly_context_ok,
+            "monthly 6M/20M/40M EMA stack bullish (context only, not itself a pullback trigger)"),
+    }
+
+    return {
+        "row": row, "checks": checks, "pullback_ema": pullback_ema,
+        "dist_from_52w_high_pct": dist_from_52w_high_pct,
+        "stop_loss": stop_loss, "risk_pct": risk_pct, "vol_ratio_val": vol_ratio_val,
+        "monthly_context_ok": monthly_context_ok,
+    }
+
+
+def _build_pullback_result(evald: dict, df: pd.DataFrame, idx: int, market_stage2: bool) -> ScanResult:
+    row = evald["row"]
+    stop_loss = evald["stop_loss"]
+    risk_pct = evald["risk_pct"]
+    pullback_ema = evald["pullback_ema"]
+    monthly_context_ok = evald["monthly_context_ok"]
+
+    threats = []
+    if not market_stage2:
+        threats.append(f"Market ({MARKET_INDEX_LABEL}) not confirmed Stage 2")
+    rsi_val = row.get("rsi14")
+    if pd.notna(rsi_val) and rsi_val > THREAT_RSI_EXTENDED:
+        threats.append(f"RSI slightly extended ({rsi_val:.1f})")
+
+    # buy_tag here = every candidacy gate passed AND the monthly context is
+    # bullish AND (market stage2, unless that gate's been demoted to informational)
+    buy_tag = bool(monthly_context_ok and (market_stage2 or not REQUIRE_MARKET_STAGE2))
+
+    ema_spread_pct = (max(row.ema5, row.ema10, row.ema20) - min(row.ema5, row.ema10, row.ema20)) / row.close * 100
+
+    return ScanResult(
+        symbol="",
+        close=round(row.close, 2),
+        ema5=round(row.ema5, 2),
+        ema10=round(row.ema10, 2),
+        ema20=round(row.ema20, 2),
+        ema40=round(row.ema40, 2),
+        rsi14=round(row.rsi14, 2) if pd.notna(row.get("rsi14")) else None,
+        adx14=round(row.adx14, 2) if pd.notna(row.get("adx14")) else None,
+        pdi14=round(row.pdi14, 2) if pd.notna(row.get("pdi14")) else None,
+        ndi14=round(row.ndi14, 2) if pd.notna(row.get("ndi14")) else None,
+        compression_pct=round(ema_spread_pct, 2),
+        ema_spread_pct=round(ema_spread_pct, 2),
+        week_date=str(row.name.date()),
+        monthly_confirmed=monthly_context_ok,
+        dist_from_52w_high_pct=evald["dist_from_52w_high_pct"],
+        base_weeks=None,
+        breakout_vol_ratio=evald["vol_ratio_val"],
+        vol_contracting=True,  # true by construction — this rule requires it to pass at all
+        tightness_label=None,
+        buy_tag=buy_tag,
+        stop_loss=stop_loss,
+        risk_pct=risk_pct,
+        threats=threats,
+        pullback_ema=pullback_ema,
+        setup_type="pullback_continuation",
+    )
+
+
+def check_pullback_row(df: pd.DataFrame, idx: int, market_stage2: bool) -> Optional[ScanResult]:
+    evald = evaluate_pullback_continuation(df, idx)
+    if evald is None:
+        return None
+    if not all(passed for passed, _ in evald["checks"].values()):
+        return None
+    return _build_pullback_result(evald, df, idx, market_stage2)
+
+
+def check_pullback_row_with_reasons(df: pd.DataFrame, idx: int, market_stage2: bool):
+    evald = evaluate_pullback_continuation(df, idx)
+    if evald is None:
+        return None, None
+    checks = evald["checks"]
+    if not all(passed for passed, _ in checks.values()):
+        return None, checks
+    return _build_pullback_result(evald, df, idx, market_stage2), checks
+
+
 _sector_cache_lock = threading.Lock()
 
 
@@ -1007,11 +1195,13 @@ _weekly_cache_lock = threading.Lock()
 def scan_symbol(symbol: str, sector_cache: dict, market_weekly: Optional[pd.DataFrame],
                  backtest: bool, lookback_weeks: int, market_stage2: bool,
                  rs_debug: bool = False, per_request_delay: float = 0.0, gate_counter: dict = None,
-                 weekly_cache: dict = None):
+                 weekly_cache: dict = None, enable_squeeze: bool = True, enable_pullback: bool = True):
     """
     Returns (results, latest_rs_vs_market_pct). rs value is returned even
     when the symbol fails other gates — it's needed to build the universe-
-    wide RS percentile distribution.
+    wide RS percentile distribution. Runs BOTH rule sets (squeeze/VCP and
+    pullback-continuation) per week when enabled — they can each independently
+    match, both match, or neither match; they are not mutually exclusive.
     """
     if per_request_delay:
         time.sleep(per_request_delay + random.uniform(0, per_request_delay))
@@ -1056,27 +1246,46 @@ def scan_symbol(symbol: str, sector_cache: dict, market_weekly: Optional[pd.Data
     if backtest:
         start_idx = max(1, len(weekly) - lookback_weeks)
         for i in range(start_idx, len(weekly)):
-            r = check_row(weekly, i, market_stage2)
+            candidates = []
+            if enable_squeeze:
+                candidates.append(check_row(weekly, i, market_stage2))
+            if enable_pullback:
+                candidates.append(check_pullback_row(weekly, i, market_stage2))
+            for r in candidates:
+                if r:
+                    r.symbol = symbol
+                    r.sector = sector
+                    r.rs_vs_sector_pct = vw_rs_sector
+                    r.rs_vs_market_pct = vw_rs_market
+                    results.append(r)
+    else:
+        idx = len(weekly) - 1
+        r_sq, checks_sq = (check_row_with_reasons(weekly, idx, market_stage2)
+                           if enable_squeeze else (None, None))
+        r_pb, checks_pb = (check_pullback_row_with_reasons(weekly, idx, market_stage2)
+                           if enable_pullback else (None, None))
+
+        if gate_counter is not None and (checks_sq is not None or checks_pb is not None):
+            with _gate_counter_lock:
+                gate_counter["_total_scanned"] = gate_counter.get("_total_scanned", 0) + 1
+                if checks_sq is not None:
+                    for check_name, (passed, _) in checks_sq.items():
+                        if not passed:
+                            key = f"squeeze::{check_name}"
+                            gate_counter[key] = gate_counter.get(key, 0) + 1
+                if checks_pb is not None:
+                    for check_name, (passed, _) in checks_pb.items():
+                        if not passed:
+                            key = f"pullback::{check_name}"
+                            gate_counter[key] = gate_counter.get(key, 0) + 1
+
+        for r in (r_sq, r_pb):
             if r:
                 r.symbol = symbol
                 r.sector = sector
                 r.rs_vs_sector_pct = vw_rs_sector
                 r.rs_vs_market_pct = vw_rs_market
                 results.append(r)
-    else:
-        r, checks = check_row_with_reasons(weekly, len(weekly) - 1, market_stage2)
-        if gate_counter is not None and checks is not None:
-            with _gate_counter_lock:
-                gate_counter["_total_scanned"] = gate_counter.get("_total_scanned", 0) + 1
-                for check_name, (passed, _) in checks.items():
-                    if not passed:
-                        gate_counter[check_name] = gate_counter.get(check_name, 0) + 1
-        if r:
-            r.symbol = symbol
-            r.sector = sector
-            r.rs_vs_sector_pct = vw_rs_sector
-            r.rs_vs_market_pct = vw_rs_market
-            results.append(r)
 
     return results, vw_rs_market
 
@@ -1234,6 +1443,7 @@ def format_results_message(buy_setups: List[ScanResult], watchlist: List[ScanRes
         base_txt = f"{r.base_weeks}w base" if r.base_weeks is not None else "base n/a"
         tightness_txt = r.tightness_label or "n/a"
         pullback_txt = f"Pullback: {r.pullback_ema} EMA" if r.pullback_ema else "Pullback: n/a"
+        rule_txt = "🔷 Squeeze/VCP" if r.setup_type == "squeeze_base" else "🔶 EMA Pullback Continuation"
         sl_txt = f"SL: ₹{r.stop_loss} ({r.risk_pct}% risk)" if r.stop_loss is not None else "SL n/a"
 
         vol_bits = []
@@ -1250,6 +1460,7 @@ def format_results_message(buy_setups: List[ScanResult], watchlist: List[ScanRes
 
         return (
             f"{prefix} *{r.symbol}* ({r.week_date}){sector_txt}{' ✅ *BUY SETUP*' if r.buy_tag else ''}\n"
+            f"  {rule_txt}\n"
             f"  Close: {r.close} | EMA5: {r.ema5} | EMA10: {r.ema10} | EMA20: {r.ema20}\n"
             f"  Dist: 5W={dist_5:.1f}% | 10W={dist_10:.1f}% | 20W={dist_20:.1f}% | EMA spread: {r.ema_spread_pct:.2f}% | {pullback_txt}\n"
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
@@ -1481,6 +1692,10 @@ def main():
     parser.add_argument("--require-adx-rising", action="store_true",
                          help="v3 default is OFF. Pass this to require ADX rising vs 4w ago as a hard "
                               "candidacy gate again (on top of the ADX_MIN floor), not just an informational flag.")
+    parser.add_argument("--no-squeeze-rule", action="store_true",
+                         help="Disable RULE 1 (EMA Squeeze / VCP-style multi-week compression).")
+    parser.add_argument("--no-pullback-rule", action="store_true",
+                         help="Disable RULE 2 (EMA Pullback Continuation — single clean pullback to 10W/20W EMA).")
     args = parser.parse_args()
 
     global REQUIRE_MARKET_STAGE2, ADX_RISING_REQUIRED
@@ -1488,6 +1703,8 @@ def main():
         REQUIRE_MARKET_STAGE2 = True
     if args.require_adx_rising:
         ADX_RISING_REQUIRED = True
+    enable_squeeze = not args.no_squeeze_rule
+    enable_pullback = not args.no_pullback_rule
 
     market_weekly = _fetch_index_weekly(MARKET_INDEX_TICKER, period="5y")
     market_index_daily = _download_with_retry(MARKET_INDEX_TICKER, period="10y", label=MARKET_INDEX_TICKER)
@@ -1527,6 +1744,7 @@ def main():
             executor.submit(
                 scan_symbol, symbol, sector_cache, market_weekly, args.backtest, args.lookback_weeks,
                 market_stage2_effective, args.rs_debug, args.delay, gate_counter, weekly_cache,
+                enable_squeeze, enable_pullback,
             ): symbol
             for symbol in symbols
         }
@@ -1559,60 +1777,4 @@ def main():
             rs_ok = r.rs_vs_market_pct is not None and r.rs_vs_market_pct >= rs_cutoff
             if not rs_ok and r.buy_tag:
                 r.buy_tag = False
-                r.threats.append(f"RS below top-{100 - RS_PERCENTILE_MIN:.0f}% cutoff ({rs_cutoff:+.1f})")
-        print(f"[RS] universe n={len(rs_pool)} | top-{100 - RS_PERCENTILE_MIN:.0f}% cutoff = {rs_cutoff:+.2f}")
-    else:
-        print("[RS] no RS values computed — RS gate skipped this run")
-
-    buy_setups = [r for r in all_candidates if r.buy_tag]
-    watchlist = [r for r in all_candidates if not r.buy_tag]
-
-    print(f"\n{len(buy_setups)} BUY SETUP(s), {len(watchlist)} watchlist candidate(s) after RS percentile gate.")
-
-    message = format_results_message(
-        buy_setups, watchlist, stage_info["detail"], rs_cutoff, args.include_watchlist
-    )
-    print(message)
-
-    if args.backtest:
-        stats = compute_backtest_r_stats(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
-        print("\n=== BACKTEST R-MULTIPLE STATS — OVERALL (weekly-close approximation) ===")
-        if stats.get("n", 0) == 0:
-            print("  No trackable matches (need forward weekly bars after the match date).")
-        else:
-            print(f"  n = {stats['n']}")
-            print(f"  Win rate: {stats['win_rate_pct']}%")
-            print(f"  Avg R: {stats['avg_r']:+.2f}")
-            print(f"  Avg win R: {stats['avg_win_r']:+.2f} | Avg loss R: {stats['avg_loss_r']:+.2f}")
-            print(f"  Expectancy per trade: {stats['expectancy_r']:+.2f}R")
-
-        by_group = compute_backtest_r_stats_by_pullback(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
-        print("\n=== BACKTEST R-MULTIPLE STATS — BY PULLBACK EMA (10W vs 20W vs 5W) ===")
-        if not by_group:
-            print("  No trackable matches.")
-        else:
-            for label, gstats in by_group.items():
-                if gstats.get("n", 0) == 0:
-                    print(f"  [{label}] no trackable matches")
-                    continue
-                print(f"  [{label}] n={gstats['n']} | win rate {gstats['win_rate_pct']}% | "
-                      f"avg R {gstats['avg_r']:+.2f} | expectancy {gstats['expectancy_r']:+.2f}R")
-            print("  (If 10W and 20W expectancy diverge meaningfully, that confirms they're "
-                  "two different setups and should be tracked/sized separately going forward — "
-                  "not evidence either one is wrong on its own.)")
-
-    to_log = [r for r in buy_setups]
-    if to_log and not args.backtest and not args.no_log_history:
-        log_matches_to_history(to_log)
-
-    if args.with_weekly_report:
-        report = generate_weekly_report(lookback_weeks=args.report_lookback_weeks, workers=args.workers)
-        print("\n" + report)
-        message = message + "\n\n" + ("─" * 20) + "\n\n" + report
-
-    if not args.dry_run and not args.backtest:
-        send_telegram_message(message)
-
-
-if __name__ == "__main__":
-    main()
+                r.threats.append(f"RS below top-{100 - RS_PERCENTILE_MIN:.0f}% cutoff ({
