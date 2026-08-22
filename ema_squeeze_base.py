@@ -577,8 +577,8 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
             print(f"[WARN] latest weekly bar ({last_bar_date.date()}) looks partial — "
                   f"run after Friday close for stable signals")
 
-    # Need enough history for the MARKET_STAGE_MA_WEEKS-week MA plus lookback margin
-    if len(weekly) < max(45, MARKET_STAGE_MA_WEEKS + 10):
+    # Need enough weekly history for the indicator stack (EMA40, 52W high, etc.)
+    if len(weekly) < 45:
         return None
 
     return weekly
