@@ -121,8 +121,6 @@ RS_PERCENTILE_MIN = 60.0   # v3: eased 70 -> 60 — top 40% of the scanned unive
 # buy_tag scan-wide regardless of how strong an individual setup was. Re-enable
 # strict enforcement with --require-market-stage if you want it back as a gate. ---
 REQUIRE_MARKET_STAGE2 = False
-MARKET_STAGE_MA_WEEKS = 30
-MARKET_STAGE_SLOPE_LOOKBACK_WEEKS = 5
 
 # --- Other threat annotations (informational only, not gates) ---
 THREAT_DIST_52W_HIGH_PCT = 18.0
@@ -570,12 +568,39 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
 
 
 def build_monthly_trend(daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Implements RK's actual monthly framework: 6/20/40-month EMA stack.
+    A monthly uptrend requires price above ALL THREE EMAs in proper stacked
+    order (6 > 20 > 40) — not just 6M > 20M, which is what v1-v3 checked.
+    The buy trigger is a pullback to EITHER the 6M or the 20M EMA (RK's own
+    wording), not just proximity to the 6M EMA alone.
+    """
     monthly = daily.resample("ME").agg({"close": "last"}).dropna()
     monthly["ema6_m"] = monthly["close"].ewm(span=6, adjust=False).mean()
     monthly["ema20_m"] = monthly["close"].ewm(span=20, adjust=False).mean()
-    monthly["monthly_uptrend"] = monthly["ema6_m"] > monthly["ema20_m"]
-    monthly["dist_to_ema6_m_pct"] = (monthly["close"] - monthly["ema6_m"]).abs() / monthly["close"]
-    return monthly[["monthly_uptrend", "dist_to_ema6_m_pct", "ema6_m", "ema20_m"]]
+    monthly["ema40_m"] = monthly["close"].ewm(span=40, adjust=False).mean()
+
+    stack_ok = (monthly["ema6_m"] > monthly["ema20_m"]) & (monthly["ema20_m"] > monthly["ema40_m"])
+    price_above_all = (
+        (monthly["close"] > monthly["ema6_m"])
+        & (monthly["close"] > monthly["ema20_m"])
+        & (monthly["close"] > monthly["ema40_m"])
+    )
+    monthly["monthly_uptrend"] = stack_ok & price_above_all
+
+    dist_to_ema6_m_pct = (monthly["close"] - monthly["ema6_m"]).abs() / monthly["close"]
+    dist_to_ema20_m_pct = (monthly["close"] - monthly["ema20_m"]).abs() / monthly["close"]
+    # Pullback trigger = close is near EITHER the 6M or the 20M EMA (RK's stated rule)
+    monthly["dist_to_ema6_m_pct"] = dist_to_ema6_m_pct
+    monthly["dist_to_ema20_m_pct"] = dist_to_ema20_m_pct
+    monthly["monthly_pullback_dist_pct"] = pd.concat(
+        [dist_to_ema6_m_pct, dist_to_ema20_m_pct], axis=1
+    ).min(axis=1)
+
+    return monthly[[
+        "monthly_uptrend", "dist_to_ema6_m_pct", "dist_to_ema20_m_pct",
+        "monthly_pullback_dist_pct", "ema6_m", "ema20_m", "ema40_m",
+    ]]
 
 
 def _clean_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -598,6 +623,8 @@ def attach_monthly_trend(weekly: pd.DataFrame, monthly_trend: pd.DataFrame) -> p
     )
     merged["monthly_uptrend"] = merged["monthly_uptrend"].fillna(False)
     merged["dist_to_ema6_m_pct"] = merged["dist_to_ema6_m_pct"].fillna(999.0)
+    merged["dist_to_ema20_m_pct"] = merged["dist_to_ema20_m_pct"].fillna(999.0)
+    merged["monthly_pullback_dist_pct"] = merged["monthly_pullback_dist_pct"].fillna(999.0)
     return merged
 
 
@@ -689,35 +716,34 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Market regime (Weinstein Stage Analysis on the index)
+# Market regime — RK's own 6/20/40-MONTH EMA stack applied to the Nifty 500,
+# not an imported US Weinstein-textbook weekly MA. Same function
+# (build_monthly_trend) that gates individual stocks, applied to the index.
+# Regime = monthly timeframe (slow, structural). Entries = weekly timeframe
+# (build_weekly / evaluate_conditions). That's the correct top-down split:
+# monthly context, weekly trigger — not two unrelated indicators.
 # ---------------------------------------------------------------------------
 
-def compute_market_stage(market_weekly: Optional[pd.DataFrame]) -> dict:
+def compute_market_stage(index_daily: Optional[pd.DataFrame]) -> dict:
     """
-    Coarse Weinstein Stage Analysis on the market index: Stage 2 requires
-    price above a RISING N-week MA. If the market itself isn't in Stage 2,
-    individual-stock base setups are fighting the tide — gate on this
-    before trusting any buy_tag.
+    Market Stage 2 = Nifty 500 monthly close above ALL of its 6M/20M/40M
+    EMAs, properly stacked (6M > 20M > 40M) — the exact same rule RK applies
+    to individual NSE names, just run on the index itself.
     """
-    if market_weekly is None or len(market_weekly) < MARKET_STAGE_MA_WEEKS + MARKET_STAGE_SLOPE_LOOKBACK_WEEKS:
-        return {"stage2": False, "detail": "insufficient market history for stage analysis"}
+    if index_daily is None or len(index_daily) < 40 * 22:  # ~40 months of trading days, rough floor
+        return {"stage2": False, "detail": "insufficient index history for monthly stage analysis"}
 
-    df = market_weekly.copy()
-    df["stage_ma"] = df["close"].rolling(window=MARKET_STAGE_MA_WEEKS).mean()
-    last = df.iloc[-1]
-    prev = df.iloc[-1 - MARKET_STAGE_SLOPE_LOOKBACK_WEEKS]
+    monthly = build_monthly_trend(index_daily)
+    if monthly.empty or monthly[["ema6_m", "ema20_m", "ema40_m"]].iloc[-1].isna().any():
+        return {"stage2": False, "detail": "6M/20M/40M EMA stack not available yet"}
 
-    if pd.isna(last["stage_ma"]) or pd.isna(prev["stage_ma"]):
-        return {"stage2": False, "detail": f"{MARKET_STAGE_MA_WEEKS}W MA not available yet"}
+    last = monthly.iloc[-1]
+    stage2 = bool(last["monthly_uptrend"])  # already encodes stack order + price-above-all
 
-    ma_rising = bool(last["stage_ma"] > prev["stage_ma"])
-    price_above_ma = bool(last["close"] > last["stage_ma"])
-    stage2 = ma_rising and price_above_ma
-
+    stack_str = f"EMA6M {last['ema6_m']:.1f} / EMA20M {last['ema20_m']:.1f} / EMA40M {last['ema40_m']:.1f}"
     detail = (
-        f"{MARKET_INDEX_LABEL} close {last['close']:.1f} "
-        f"{'>' if price_above_ma else '<='} {MARKET_STAGE_MA_WEEKS}W MA {last['stage_ma']:.1f} "
-        f"({'rising' if ma_rising else 'flat/falling'} vs {MARKET_STAGE_SLOPE_LOOKBACK_WEEKS}w ago)"
+        f"{MARKET_INDEX_LABEL} monthly ({last.name.strftime('%Y-%m')}): {stack_str} — "
+        f"{'price above full bullish stack (Stage 2)' if stage2 else 'stack not confirmed bullish'}"
     )
     return {"stage2": stage2, "detail": detail}
 
@@ -815,7 +841,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int) -> Optional[dict]:
     adx_ok = adx_floor_ok and (adx_rising_ok if ADX_RISING_REQUIRED else True)
 
     monthly_uptrend = bool(row.get("monthly_uptrend", False))
-    monthly_dist = row.get("dist_to_ema6_m_pct", 999.0)
+    monthly_dist = row.get("monthly_pullback_dist_pct", 999.0)
     monthly_retest = bool(pd.notna(monthly_dist) and monthly_dist <= MONTHLY_RETEST_PCT)
     monthly_confirmed = monthly_uptrend and monthly_retest
 
@@ -1426,7 +1452,12 @@ def main():
         ADX_RISING_REQUIRED = True
 
     market_weekly = _fetch_index_weekly(MARKET_INDEX_TICKER, period="5y")
-    stage_info = compute_market_stage(market_weekly)
+    market_index_daily = _download_with_retry(MARKET_INDEX_TICKER, period="10y", label=MARKET_INDEX_TICKER)
+    if market_index_daily is not None:
+        if isinstance(market_index_daily.columns, pd.MultiIndex):
+            market_index_daily.columns = market_index_daily.columns.get_level_values(0)
+        market_index_daily.columns = [c.lower() for c in market_index_daily.columns]
+    stage_info = compute_market_stage(market_index_daily)
     market_stage2_effective = stage_info["stage2"] or args.ignore_market_stage or not REQUIRE_MARKET_STAGE2
     print(f"[MARKET] {stage_info['detail']} -> stage2={stage_info['stage2']}"
           f"{' (override active, gate not enforced)' if args.ignore_market_stage else ''}")
