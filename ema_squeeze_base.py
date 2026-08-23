@@ -1389,10 +1389,15 @@ def compute_backtest_r_stats_by_pullback(results: List[ScanResult], weekly_cache
     cohort. This is the actual test of whether "buy the 10W or 20W EMA" is
     one edge or two different ones — pooling them, as the original stated
     rule did, hides that distinction entirely.
+
+    NOTE: "unclassified" here means the match came from Rule 1 (squeeze/VCP),
+    which doesn't produce a 10W/20W/5W tag the way Rule 2 does — it is NOT a
+    grab-bag of failed classifications. See compute_backtest_r_stats_by_setup_type
+    for that split labeled explicitly.
     """
-    groups: dict = {"5W": [], "10W": [], "20W": [], "unclassified": []}
+    groups: dict = {"5W": [], "10W": [], "20W": [], "unclassified (squeeze/VCP)": []}
     for r in results:
-        key = r.pullback_ema if r.pullback_ema in groups else "unclassified"
+        key = r.pullback_ema if r.pullback_ema in ("5W", "10W", "20W") else "unclassified (squeeze/VCP)"
         groups[key].append(r)
 
     return {
@@ -1400,6 +1405,52 @@ def compute_backtest_r_stats_by_pullback(results: List[ScanResult], weekly_cache
         for label, group_results in groups.items()
         if group_results
     }
+
+
+def compute_backtest_r_stats_by_setup_type(results: List[ScanResult], weekly_cache: dict,
+                                            forward_weeks: int = 8) -> dict:
+    """
+    Splits backtest results by which RULE produced the match (squeeze/VCP vs
+    pullback continuation) and runs stats separately on each. This is the
+    direct test of whether Rule 1 is pulling its weight or dragging the
+    pooled numbers down.
+    """
+    groups: dict = {"squeeze_base": [], "pullback_continuation": []}
+    for r in results:
+        if r.setup_type in groups:
+            groups[r.setup_type].append(r)
+
+    return {
+        label: compute_backtest_r_stats(group_results, weekly_cache, forward_weeks=forward_weeks)
+        for label, group_results in groups.items()
+        if group_results
+    }
+
+
+def deduplicate_backtest_matches(results: List[ScanResult]) -> List[ScanResult]:
+    """
+    Collapses contiguous weekly matches (same symbol, same setup_type) into a
+    single trade, keeping only the FIRST week of each streak. Without this, a
+    stock that stays glued to its EMA for 5 straight weeks counts as 5
+    "trades" in the backtest — inflating n and mixing five highly-correlated
+    outcomes of essentially one position into what looks like independent
+    sample size. A gap of more than one missed week (>10 days between
+    consecutive matches) is treated as the start of a new, separate trade.
+    """
+    groups: dict = {}
+    for r in results:
+        groups.setdefault((r.symbol, r.setup_type), []).append(r)
+
+    deduped: List[ScanResult] = []
+    for (_symbol, _setup_type), group in groups.items():
+        group_sorted = sorted(group, key=lambda r: r.week_date)
+        prev_date = None
+        for r in group_sorted:
+            cur_date = pd.Timestamp(r.week_date)
+            if prev_date is None or (cur_date - prev_date).days > 10:
+                deduped.append(r)
+            prev_date = cur_date
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -1829,8 +1880,13 @@ def main():
     print(message)
 
     if args.backtest:
-        stats = compute_backtest_r_stats(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
-        print("\n=== BACKTEST R-MULTIPLE STATS — OVERALL (weekly-close approximation) ===")
+        raw_n = len(all_candidates)
+        deduped_candidates = deduplicate_backtest_matches(all_candidates)
+        print(f"\n[DEDUP] {raw_n} raw weekly matches -> {len(deduped_candidates)} independent trades "
+              f"(collapsed contiguous same-symbol/same-rule streaks). All stats below use the deduped set.")
+
+        stats = compute_backtest_r_stats(deduped_candidates, weekly_cache, forward_weeks=args.forward_weeks)
+        print("\n=== BACKTEST R-MULTIPLE STATS — OVERALL (weekly-close approximation, deduped) ===")
         if stats.get("n", 0) == 0:
             print("  No trackable matches (need forward weekly bars after the match date).")
         else:
@@ -1840,8 +1896,20 @@ def main():
             print(f"  Avg win R: {stats['avg_win_r']:+.2f} | Avg loss R: {stats['avg_loss_r']:+.2f}")
             print(f"  Expectancy per trade: {stats['expectancy_r']:+.2f}R")
 
-        by_group = compute_backtest_r_stats_by_pullback(all_candidates, weekly_cache, forward_weeks=args.forward_weeks)
-        print("\n=== BACKTEST R-MULTIPLE STATS — BY PULLBACK EMA (10W vs 20W vs 5W) ===")
+        by_setup = compute_backtest_r_stats_by_setup_type(deduped_candidates, weekly_cache, forward_weeks=args.forward_weeks)
+        print("\n=== BACKTEST R-MULTIPLE STATS — BY RULE (squeeze/VCP vs pullback continuation, deduped) ===")
+        if not by_setup:
+            print("  No trackable matches.")
+        else:
+            for label, gstats in by_setup.items():
+                if gstats.get("n", 0) == 0:
+                    print(f"  [{label}] no trackable matches")
+                    continue
+                print(f"  [{label}] n={gstats['n']} | win rate {gstats['win_rate_pct']}% | "
+                      f"avg R {gstats['avg_r']:+.2f} | expectancy {gstats['expectancy_r']:+.2f}R")
+
+        by_group = compute_backtest_r_stats_by_pullback(deduped_candidates, weekly_cache, forward_weeks=args.forward_weeks)
+        print("\n=== BACKTEST R-MULTIPLE STATS — BY PULLBACK EMA (10W vs 20W vs 5W, deduped) ===")
         if not by_group:
             print("  No trackable matches.")
         else:
