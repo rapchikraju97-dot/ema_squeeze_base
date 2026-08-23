@@ -1,5 +1,5 @@
 """
-EMA Squeeze Base Scanner v2 — RS-percentile, hard-gated risk/base/ADX,
+EMA Squeeze Base Scanner v3 — RS-percentile, hard-gated risk/base/ADX,
 market-stage aware, with real R-multiple backtest stats.
 -----------------------------------------------------------------------
 CHANGES FROM v1 (see accompanying notes for the "why"):
