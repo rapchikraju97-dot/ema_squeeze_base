@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: 'NSE symbol (jaise CCL, INOXINDIA)'
+        description: 'NSE symbol (CCL, INOXINDIA)'
         required: true
         default: 'CCL'
 
