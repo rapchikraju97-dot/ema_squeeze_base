@@ -1,15 +1,10 @@
-name: Explain Symbol (Debug)
+name: Backtest (Debug)
 
 on:
   workflow_dispatch:
-    inputs:
-      symbol:
-        description: 'NSE symbol (CCL, INOXINDIA)'
-        required: true
-        default: 'CCL'
 
 jobs:
-  explain:
+  backtest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,4 +12,4 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install yfinance pandas numpy ta requests
-      - run: python ema_squeeze_base_v3.py --explain ${{ github.event.inputs.symbol }}
+      - run: python ema_squeeze_base_.py --backtest --lookback-weeks 52 --forward-weeks 8 --dry-run
