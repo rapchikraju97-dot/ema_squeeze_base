@@ -12,4 +12,4 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install yfinance pandas numpy ta requests
-      - run: python ema_squeeze_base_.py --backtest --lookback-weeks 52 --forward-weeks 8 --dry-run
+      - run: python ema_squeeze_base.py --backtest --lookback-weeks 52 --forward-weeks 8 --dry-run
