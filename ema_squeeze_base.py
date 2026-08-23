@@ -1,5 +1,5 @@
 """
-EMA Squeeze Base Scanner v3 — RS-percentile, hard-gated risk/base/ADX,
+EMA Squeeze Base Scanner v2 — RS-percentile, hard-gated risk/base/ADX,
 market-stage aware, with real R-multiple backtest stats.
 -----------------------------------------------------------------------
 CHANGES FROM v1 (see accompanying notes for the "why"):
@@ -1469,6 +1469,19 @@ def format_results_message(buy_setups: List[ScanResult], watchlist: List[ScanRes
         rule_txt = "🔷 Squeeze/VCP" if r.setup_type == "squeeze_base" else "🔶 EMA Pullback Continuation"
         sl_txt = f"SL: ₹{r.stop_loss} ({r.risk_pct}% risk)" if r.stop_loss is not None else "SL n/a"
 
+        # v3 fix follow-up: show the support-held math directly in every pullback
+        # entry, so "why is this stock tagged as 10W/20W support" never needs a
+        # separate --explain run — it's right here in the normal scan output.
+        support_check_txt = ""
+        if r.setup_type == "pullback_continuation":
+            tol = SUPPORT_CLOSE_TOLERANCE_PCT / 100
+            held_10 = r.close >= r.ema10 * (1 - tol)
+            held_20 = r.close >= r.ema20 * (1 - tol)
+            support_check_txt = (
+                f"\n  🔍 Support check: close {r.close} vs EMA10 {r.ema10} (held: {held_10}) | "
+                f"vs EMA20 {r.ema20} (held: {held_20})"
+            )
+
         vol_bits = []
         if r.breakout_vol_ratio is not None:
             if r.breakout_vol_ratio >= HIGH_VOL_BREAKOUT_RATIO:
@@ -1489,7 +1502,7 @@ def format_results_message(buy_setups: List[ScanResult], watchlist: List[ScanRes
             f"  RSI: {rsi_txt} | ADX: {adx_txt}\n"
             f"  RS vs {MARKET_INDEX_LABEL}: {rs_mkt} | RS vs Sector: {rs_sec}\n"
             f"  {off_high_txt} | {base_txt} ({tightness_txt})\n"
-            f"  🎯 *{sl_txt}* | {vol_txt}{threats_txt}\n"
+            f"  🎯 *{sl_txt}* | {vol_txt}{threats_txt}{support_check_txt}\n"
         )
 
     lines = [f"*EMA Squeeze Scan v3*"]
