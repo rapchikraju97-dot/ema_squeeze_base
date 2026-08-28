@@ -1,4 +1,4 @@
-name: EMA Squeeze Base Weekly Scan
+name: EMA Squeeze Base Scanner
 
 on:
   schedule:
@@ -28,12 +28,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance pandas numpy ta requests
 
-      - name: Run EMA Squeeze Scanner
+      - name: Run EMA Squeeze Base Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python ema_squeeze_base_v2.py
+          python EMA Squeeze Base Scanner.py
 
       - name: Commit and push match history
         run: |
