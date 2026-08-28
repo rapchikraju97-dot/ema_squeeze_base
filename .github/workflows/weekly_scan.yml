@@ -1,0 +1,43 @@
+name: EMA Squeeze Base Weekly Scan
+
+on:
+  schedule:
+    # Monday + Friday, 18:00 IST = 12:30 UTC
+    - cron: '30 12 * * 1,5'
+  workflow_dispatch: {}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python ema_squeeze_base_v2.py
+
+      - name: Commit match history
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add match_history.csv || true
+          git commit -m "Auto-update match history [skip ci]" || echo "No changes to commit"
+          git push || echo "Push skipped"
