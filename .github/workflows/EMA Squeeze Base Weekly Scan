@@ -2,9 +2,9 @@ name: EMA Squeeze Base Weekly Scan
 
 on:
   schedule:
-    # Monday + Friday at 18:00 IST (12:30 UTC)
+    # Monday + Friday, 18:00 IST = 12:30 UTC
     - cron: '30 12 * * 1,5'
-  workflow_dispatch: {}   # Allows manual trigger anytime from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
   scan:
@@ -17,11 +17,10 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install dependencies
         run: |
@@ -33,7 +32,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python ema_squeeze_base_v2.py --with-weekly-report
+          python ema_squeeze_base_v2.py
 
       - name: Commit and push match history
         run: |
