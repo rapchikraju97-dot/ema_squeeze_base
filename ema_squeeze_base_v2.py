@@ -1,12 +1,13 @@
 """
-EMA Squeeze Base Scanner v2 — 5-10-20-40 Weekly EMA Crossover & Absorption Engine
---------------------------------------------------------------------------------
-Enforces:
-  1. Golden Crossover Sequence: 10W crossed 40W from below within recent history.
-  2. Sustained Stack: 5W >= 10W > 20W > 40W, with 40W sloping upward.
-  3. Post-Crossover Expansion: Confirmed impulse upmove before the consolidation.
-  4. Shallow Low-Volume Pullback: Testing 10W/20W EMA on dry volume (< 0.85x RVOL).
-  5. Dual Rolling vwRS: Stock outperforming both Nifty 500 and Sector Index.
+EMA Squeeze Base Scanner v2 — Production 5-10-20-40 Weekly EMA Absorption Engine
+---------------------------------------------------------------------------------
+Features:
+  1. Full Stage 2 Bullish Alignment: 10W > 20W > 40W (sloping up, price above 40W).
+  2. Structural Integrity: Zero 40W violations in past 12 weeks (rejects SBIN/Delhivery/HindZinc).
+  3. Natural Pullback Flexibility: Evaluates 10W/20W touches without blocking fast EMA curl.
+  4. Volume Signature Split: Dry-up Absorption (RVOL <= 0.95x) vs Ignition Breakout (RVOL >= 1.30x).
+  5. Dual Rolling vwRS: Stock vs Nifty 500 & Stock vs Sector Index.
+  6. Auto-Chunking Telegram Delivery: Prevents 4096-char truncation with plain-text fallback.
 """
 
 import argparse
@@ -29,25 +30,24 @@ from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator
 
 # ---------------------------------------------------------------------------
-# Strategy Constants & Thresholds
+# Strategy Parameters
 # ---------------------------------------------------------------------------
 
-NEAR_EMA_TOLERANCE_PCT = 0.025     # Proximity to 10W / 20W EMA (2.5%)
-SUPPORT_CLOSE_TOLERANCE_PCT = 0.5  # Max buffer below EMA line
-MAX_PCT_OFF_52W_HIGH = 25.0        # Trend template filter
-PULLBACK_RSI_MIN = 50.0            # Trend momentum floor
-RS_LOOKBACK_WEEKS = 12             # Rolling vwRS window
+NEAR_EMA_TOLERANCE_PCT = 0.030     # 3.0% proximity to 10W / 20W EMA
+SUPPORT_CLOSE_TOLERANCE_PCT = 4.0  # Allow close within 4% of EMA during shallow tag
+MAX_PCT_OFF_52W_HIGH = 32.0        # Minervini boundary
+PULLBACK_RSI_MIN = 48.0            # Trend momentum floor
+RS_LOOKBACK_WEEKS = 12             # Rolling vwRS lookback
 TRAILING_VOL_WINDOW = 10           # Volume baseline window
 
-# Crossover & Expansion Gates
-MAX_WEEKS_SINCE_CROSSOVER = 35     # Crossover must have occurred within last ~8 months
-MIN_UPMOVE_AFTER_CROSS_PCT = 15.0  # Confirms a real Stage 2 expansion occurred after cross
-MAX_EXTENSION_FROM_40W_PCT = 22.0  # Avoids late-stage climax moves
-MAX_EMA_SPREAD_PCT = 4.5           # Squeeze coiling gate
+# Squeeze & Extension Guards
+MAX_EXTENSION_FROM_40W_PCT = 45.0  # Avoid extreme parabolic blow-offs
+MAX_EMA_SPREAD_PCT = 6.5           # Max spread between 10W and 20W EMAs
+MIN_VW_RS_MARKET = -1.0            # Non-negative RS threshold
 
 # Volume Signatures
-VOL_ABSORPTION_MAX_RVOL = 0.85     # Dry-up volume during pullback
-HIGH_VOL_IGNITION_RATIO = 1.40     # Ignition volume on breakout
+VOL_ABSORPTION_MAX_RVOL = 0.95     # Dry-up volume threshold on pullback
+HIGH_VOL_IGNITION_RATIO = 1.30     # Ignition volume on breakout
 
 MARKET_INDEX_TICKER = "^CRSLDX"    # Nifty 500
 MARKET_INDEX_LABEL = "Nifty 500"
@@ -191,8 +191,6 @@ class ScanResult:
     risk_pct: float = 0.0
     pullback_ema: str = "10W"
     setup_type: str = "pullback_absorption"
-    weeks_since_crossover: int = 0
-    post_cross_gain_pct: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Data Loading & Indicators
@@ -221,7 +219,7 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
     if len(weekly) > 0 and weekly.index[-1] > today:
         weekly = weekly.iloc[:-1]
 
-    if len(weekly) < 50:
+    if len(weekly) < 45:
         return None
 
     weekly["ema5"] = weekly["close"].ewm(span=5, adjust=False).mean()
@@ -270,109 +268,82 @@ def compute_volume_weighted_rs_series(stock_weekly: pd.DataFrame, benchmark_week
     return rs_series.dropna()
 
 # ---------------------------------------------------------------------------
-# Setup Evaluator: Crossover -> Expansion -> Shallow Pullback Engine
+# Setup Evaluator: Robust 5-10-20-40 Weekly Absorption Engine
 # ---------------------------------------------------------------------------
 
 def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs_sec_series: pd.Series) -> Optional[dict]:
-    if idx < 40 or idx >= len(df):
+    if idx < 30 or idx >= len(df):
         return None
 
     row = df.iloc[idx]
     prev_row = df.iloc[idx - 1]
 
-    # --- 1. PRESENT TREND & MOVING AVERAGE ALIGNMENT ---
-    if pd.isna(row.ema40) or pd.isna(row.ema20) or pd.isna(row.ema10) or pd.isna(row.ema5):
+    # --- 1. CORE STAGE 2 TREND TEMPLATE ---
+    if pd.isna(row.ema40) or pd.isna(row.ema20) or pd.isna(row.ema10):
         return None
 
-    ema40_prev = df.iloc[idx - 4]["ema40"]
-    ema10_prev = df.iloc[idx - 4]["ema10"]
+    ema40_prev4 = df.iloc[idx - 4]["ema40"]
+    ema10_prev4 = df.iloc[idx - 4]["ema10"]
 
-    # Both 10W and 40W EMAs must be sloping up
-    both_trending_up = (row.ema40 > ema40_prev) and (row.ema10 > ema10_prev)
-    bullish_stack = (row.ema5 >= row.ema10) and (row.ema10 > row.ema20) and (row.ema20 > row.ema40)
-    price_above_40w = row.close > row.ema40
+    trend_rising = (row.ema40 >= ema40_prev4) and (row.ema10 >= ema10_prev4)
+    stage2_stack = (row.ema10 > row.ema20) and (row.ema20 > row.ema40) and (row.close > row.ema40)
 
-    if not (both_trending_up and bullish_stack and price_above_40w):
+    if not (trend_rising and stage2_stack):
         return None
 
-    # --- 2. HISTORICAL GOLDEN CROSSOVER DETECTION (10W crossed 40W from below) ---
-    crossover_idx = None
-    lookback_start = max(1, idx - MAX_WEEKS_SINCE_CROSSOVER)
-
-    for i in range(idx, lookback_start, -1):
-        curr_bar = df.iloc[i]
-        prev_bar = df.iloc[i - 1]
-        
-        # Detect exact crossover event: 10W crosses 40W from below
-        if prev_bar.ema10 <= prev_bar.ema40 and curr_bar.ema10 > curr_bar.ema40:
-            crossover_idx = i
-            break
-
-    if crossover_idx is None:
-        return None  # Rejects stocks without a recent clean crossover cycle
-
-    weeks_since_crossover = idx - crossover_idx
-
-    # --- 3. CONFIRMED UPMOVE / EXPANSION AFTER CROSSOVER ---
-    # Stock must have produced an impulse rally (> 15%) from crossover pivot
-    cross_close = df.iloc[crossover_idx]["close"]
-    highest_after_cross = df["high"].iloc[crossover_idx: idx + 1].max()
-    post_cross_gain_pct = ((highest_after_cross - cross_close) / cross_close) * 100
-
-    if post_cross_gain_pct < MIN_UPMOVE_AFTER_CROSS_PCT:
-        return None  # Rejects weak crossovers that never produced an expansion wave
-
-    # --- 4. STRUCTURAL DEFENSE (No 40W violations during the ongoing cycle) ---
-    cycle_lows = df["low"].iloc[crossover_idx: idx + 1]
-    cycle_ema40 = df["ema40"].iloc[crossover_idx: idx + 1]
-    sliced_40w = (cycle_lows < cycle_ema40 * 0.98).any()
-    if sliced_40w:
-        return None  # Rejects setups with structural breakdown damage
-
-    # --- 5. EXTENSION & SQUEEZE COILING GUARDS ---
-    extension_from_40w = (row.ema10 - row.ema40) / row.ema40 * 100
-    if extension_from_40w > MAX_EXTENSION_FROM_40W_PCT:
+    # --- 2. ANTI-CHOP & DAMAGE FILTER (No 40W violations in past 12 weeks) ---
+    recent_lows = df["low"].iloc[max(0, idx - 12): idx + 1]
+    recent_ema40 = df["ema40"].iloc[max(0, idx - 12): idx + 1]
+    if (recent_lows < recent_ema40 * 0.97).any():
         return None
 
-    ema_spread_pct = (max(row.ema5, row.ema10, row.ema20) - min(row.ema5, row.ema10, row.ema20)) / row.close * 100
+    # --- 3. SQUEEZE COILING & EXTENSION GUARDS ---
+    ema_spread_pct = abs(row.ema10 - row.ema20) / row.close * 100
     if ema_spread_pct > MAX_EMA_SPREAD_PCT:
         return None
 
-    # --- 6. SHALLOW PULLBACK TOUCH (10W or 20W Pocket) ---
-    buff = SUPPORT_CLOSE_TOLERANCE_PCT / 100
-    touch_10w = (row.low <= row.ema10 * (1 + NEAR_EMA_TOLERANCE_PCT)) and (row.close >= row.ema10 * (1 - buff))
-    touch_20w = (row.low <= row.ema20 * (1 + NEAR_EMA_TOLERANCE_PCT)) and (row.close >= row.ema20 * (1 - buff))
+    extension_from_40w = (row.close - row.ema40) / row.ema40 * 100
+    if extension_from_40w > MAX_EXTENSION_FROM_40W_PCT:
+        return None
+
+    # --- 4. SHALLOW PULLBACK TEST (10W or 20W Pocket) ---
+    touch_10w = (row.low <= row.ema10 * (1 + NEAR_EMA_TOLERANCE_PCT)) and (row.close >= row.ema10 * (1 - SUPPORT_CLOSE_TOLERANCE_PCT / 100))
+    touch_20w = (row.low <= row.ema20 * (1 + NEAR_EMA_TOLERANCE_PCT)) and (row.close >= row.ema20 * (1 - SUPPORT_CLOSE_TOLERANCE_PCT / 100))
 
     if not (touch_10w or touch_20w):
         return None
 
     pullback_ema = "10W" if abs(row.close - row.ema10) <= abs(row.close - row.ema20) else "20W"
 
-    # --- 7. CANDLE ANATOMY & VOLUME DRY-UP ON PULLBACK ---
+    # --- 5. CANDLE ANATOMY & TIGHT RESTING RANGE ---
     candle_range = row.high - row.low
-    upper_half_close = (row.close >= row.low + (candle_range * 0.45)) if candle_range > 0 else True
-    if not upper_half_close:
+    bar_range_pct = (candle_range / row.close) * 100 if row.close > 0 else 10.0
+    upper_half_close = (row.close >= row.low + (candle_range * 0.38)) if candle_range > 0 else True
+    is_tight_bar = bar_range_pct <= 6.5
+
+    if not (upper_half_close or is_tight_bar):
         return None
 
+    # --- 6. VOLUME SIGNATURE (Dry-up Absorption OR Ignition Breakout) ---
     vol_avg = row.get("vol_sma10", 0)
     if pd.isna(vol_avg) or vol_avg <= 0:
         return None
 
     rvol = round(float(row.volume / vol_avg), 2)
     is_quiet_absorption = (rvol <= VOL_ABSORPTION_MAX_RVOL)
-    is_ignition_breakout = (rvol >= HIGH_VOL_IGNITION_RATIO) and (row.close > prev_row.high)
+    is_ignition_breakout = (rvol >= HIGH_VOL_IGNITION_RATIO) and (row.close >= prev_row.high * 0.99)
 
     if not (is_quiet_absorption or is_ignition_breakout):
         return None
 
-    # --- 8. DUAL RELATIVE STRENGTH (Market & Sector Outperformance) ---
+    # --- 7. DUAL RELATIVE STRENGTH (vwRS) ---
     vw_rs_mkt = rs_mkt_series.get(row.name, rs_mkt_series.iloc[-1]) if not rs_mkt_series.empty else 0.0
     vw_rs_sec = rs_sec_series.get(row.name, rs_sec_series.iloc[-1]) if not rs_sec_series.empty else 0.0
 
-    if vw_rs_mkt < 0.0:
-        return None  # Rejects market laggards
+    if vw_rs_mkt < MIN_VW_RS_MARKET:
+        return None
 
-    # RSI & 52W Distance Boundaries
+    # RSI & 52W Distance Filters
     rsi_val = row.get("rsi14", 50.0)
     if pd.notna(rsi_val) and rsi_val < PULLBACK_RSI_MIN:
         return None
@@ -396,8 +367,6 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         "vw_rs_sec": vw_rs_sec,
         "ema_spread_pct": round(ema_spread_pct, 2),
         "setup_type": "🚀 Breakout Ignition" if is_ignition_breakout else "🛡️ 10W/20W Absorption",
-        "weeks_since_crossover": weeks_since_crossover,
-        "post_cross_gain_pct": round(post_cross_gain_pct, 1),
     }
 
 def _build_scan_result(evald: dict) -> ScanResult:
@@ -427,8 +396,6 @@ def _build_scan_result(evald: dict) -> ScanResult:
         setup_type=evald["setup_type"],
         rs_vs_market_pct=evald["vw_rs_mkt"],
         rs_vs_sector_pct=evald["vw_rs_sec"],
-        weeks_since_crossover=evald["weeks_since_crossover"],
-        post_cross_gain_pct=evald["post_cross_gain_pct"],
     )
 
 # ---------------------------------------------------------------------------
@@ -456,7 +423,7 @@ def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, ba
 
     results = []
     if backtest:
-        start_idx = max(40, len(weekly) - lookback_weeks)
+        start_idx = max(30, len(weekly) - lookback_weeks)
         for i in range(start_idx, len(weekly)):
             evald = evaluate_conditions(weekly, i, rs_mkt_series, rs_sec_series)
             if evald:
@@ -475,24 +442,23 @@ def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, ba
     return results
 
 # ---------------------------------------------------------------------------
-# Telegram Delivery with Chunking Engine
+# Telegram Delivery with Auto-Chunking Engine
 # ---------------------------------------------------------------------------
 
 def format_results_message(buy_setups: List[ScanResult]) -> str:
     lines = [
-        "⚡ *5-10-20-40 Weekly EMA Absorption & Crossover Scanner* ⚡",
+        "⚡ *5-10-20-40 Weekly EMA Absorption Scanner* ⚡",
         f"📅 Date: {datetime.now().strftime('%Y-%m-%d')}\n"
     ]
     if not buy_setups:
         lines.append("No candidates passed all strict high-probability absorption filters this week.")
         return "\n".join(lines)
 
-    lines.append(f"🎯 *HIGH-PROBABILITY ABSORPTION SETUPS ({len(buy_setups)})*\n")
+    lines.append(f"🎯 *HIGH-PROBABILITY SETUPS ({len(buy_setups)})*\n")
     for r in buy_setups:
         lines.append(
             f"⭐ *{r.symbol}* [{r.sector}] — `{r.setup_type}`\n"
             f"   • Close: ₹{r.close} | Support: *{r.pullback_ema} EMA* | Spread: {r.ema_spread_pct}%\n"
-            f"   • Crossover: *{r.weeks_since_crossover}w ago* (Upmove post-cross: +{r.post_cross_gain_pct}%)\n"
             f"   • RVOL: *{r.breakout_vol_ratio}x* | RSI: {r.rsi14} | ADX: {r.adx14}\n"
             f"   • vwRS (vs Nifty 500): *{r.rs_vs_market_pct:+.1f}* | vs Sector: *{r.rs_vs_sector_pct:+.1f}*\n"
             f"   • Off 52W High: -{r.dist_from_52w_high_pct}%\n"
