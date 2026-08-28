@@ -17,10 +17,11 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python
+     - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          # Removed cache: 'pip' to prevent missing requirements.txt error
 
       - name: Install dependencies
         run: |
