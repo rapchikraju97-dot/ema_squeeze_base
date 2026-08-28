@@ -2,29 +2,39 @@ name: EMA Squeeze Weekly Performance Report
 
 on:
   schedule:
-    # Friday, 19:00 IST = 13:30 UTC — 1 hour after the Friday scan (18:00 IST) so it has
-    # time to finish (scan has a 30-min timeout) before this report reads match_history.csv
+    # Friday, 19:00 IST = 13:30 UTC (1 hour after the Friday 18:00 IST scan)
     - cron: '30 13 * * 5'
   workflow_dispatch: {}
 
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Set up Python
+        with:
+          fetch-depth: 0
+
+      - name: Pull latest match history
+        run: |
+          git pull origin main || git pull
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install yfinance pandas ta requests
-      - name: Send weekly report
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy ta requests
+
+      - name: Generate & Send Weekly Report
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python ema_squeeze_base.py --weekly-report --report-lookback-weeks 8
+          python ema_squeeze_base_v2.py --weekly-report --report-lookback-weeks 8
