@@ -1,5 +1,6 @@
 """
 EMA Squeeze Base Scanner v2 — 5-10-20-40 Weekly EMA Absorption & Breakout Engine
+With Auto-Chunking Telegram Delivery & Plain-Text Fallback
 """
 
 import argparse
@@ -52,8 +53,8 @@ MATCH_HISTORY_FIELDS = [
 ]
 DEFAULT_REPORT_LOOKBACK_WEEKS = 8
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 # ---------------------------------------------------------------------------
 # Universe & Sector Mapping
@@ -362,9 +363,6 @@ def compute_volume_weighted_rs_series(stock_weekly: pd.DataFrame, benchmark_week
     rs_series = (combined["vw_rs_component"].rolling(window=RS_LOOKBACK_WEEKS).sum() * 100).round(2)
     return rs_series.dropna()
 
-def compute_market_stage(index_daily: Optional[pd.DataFrame]) -> dict:
-    return {"stage2": True, "detail": f"{MARKET_INDEX_LABEL} uptrend baseline active"}
-
 # ---------------------------------------------------------------------------
 # Setup Evaluator Engine
 # ---------------------------------------------------------------------------
@@ -583,7 +581,7 @@ def compute_backtest_r_stats(results: List[ScanResult], weekly_cache: dict, forw
     }
 
 # ---------------------------------------------------------------------------
-# Output & Telegram Messaging
+# Output & Auto-Chunking Telegram Engine
 # ---------------------------------------------------------------------------
 
 def format_results_message(buy_setups: List[ScanResult]) -> str:
@@ -604,14 +602,55 @@ def format_results_message(buy_setups: List[ScanResult]) -> str:
         )
     return "\n".join(lines)
 
+def split_message_into_chunks(text: str, max_length: int = 3500) -> List[str]:
+    """Splits long text strictly within Telegram's 4096-character limit."""
+    if len(text) <= max_length:
+        return [text]
+
+    blocks = text.split("\n\n")
+    chunks = []
+    current_chunk = ""
+
+    for block in blocks:
+        if len(current_chunk) + len(block) + 2 <= max_length:
+            current_chunk = (current_chunk + "\n\n" + block) if current_chunk else block
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = block
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
 def send_telegram_message(text: str):
+    """Robust message delivery with chunking and plain-text fallback."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram Credentials Missing — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty.")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-    except Exception:
-        pass
+    chunks = split_message_into_chunks(text)
+    print(f"[INFO] Preparing to send Telegram alert in {len(chunks)} part(s)...")
+
+    for i, chunk in enumerate(chunks, 1):
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
+        try:
+            resp = requests.post(url, data=payload, timeout=15)
+            if resp.status_code == 200:
+                print(f"[SUCCESS] Telegram chunk {i}/{len(chunks)} delivered (HTTP 200).")
+            else:
+                print(f"[WARN] Markdown send failed on chunk {i} (Status: {resp.status_code}). Trying plain text fallback...")
+                payload_plain = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
+                resp_fallback = requests.post(url, data=payload_plain, timeout=15)
+                if resp_fallback.status_code == 200:
+                    print(f"[SUCCESS] Telegram chunk {i}/{len(chunks)} delivered via plain text fallback.")
+                else:
+                    print(f"[ERROR] Telegram Delivery Failed (HTTP {resp_fallback.status_code}): {resp_fallback.text}")
+        except Exception as e:
+            print(f"[ERROR] Connection failed on chunk {i}: {e}")
+        time.sleep(0.5)
 
 def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HISTORY_CSV):
     existing_keys = set()
