@@ -202,7 +202,10 @@ class ScanResult:
 # Data Fetching & Technical Indicators
 # ---------------------------------------------------------------------------
 
-def _download_with_retry(ticker: str, period: str = "5y") -> Optional[pd.DataFrame]:
+def _download_with_retry(ticker: str, period: str = "5y", request_delay: float = 0.0) -> Optional[pd.DataFrame]:
+    if request_delay > 0:
+        # Small jitter avoids every worker hitting Yahoo in lockstep.
+        time.sleep(request_delay + random.uniform(0, request_delay * 0.5))
     for attempt in range(DOWNLOAD_RETRIES):
         try:
             daily = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True, timeout=12)
@@ -239,6 +242,9 @@ def build_weekly(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
     weekly["pdi14"] = adx_ind.adx_pos()
     weekly["ndi14"] = adx_ind.adx_neg()
 
+    # NOTE: true 52-week high needs a full 52 bars; min_periods=40 lets this
+    # read as a "52w high" while only having 40 weeks of data for younger
+    # listings / early history. Kept intentionally lenient but documented.
     weekly["high_52w"] = weekly["high"].rolling(window=52, min_periods=40).max()
     weekly["vol_sma10"] = weekly["volume"].rolling(window=TRAILING_VOL_WINDOW).mean()
     return weekly
@@ -247,9 +253,13 @@ def compute_volume_weighted_rs_series(stock_weekly: pd.DataFrame, benchmark_week
     if stock_weekly is None or benchmark_weekly is None:
         return pd.Series(dtype=float)
 
-    idx_s = pd.to_datetime(stock_weekly.index).tz_localize(None)
-    idx_b = pd.to_datetime(benchmark_weekly.index).tz_localize(None)
-    
+    idx_s = pd.to_datetime(stock_weekly.index)
+    if idx_s.tz is not None:
+        idx_s = idx_s.tz_localize(None)
+    idx_b = pd.to_datetime(benchmark_weekly.index)
+    if idx_b.tz is not None:
+        idx_b = idx_b.tz_localize(None)
+
     sw = stock_weekly.copy()
     bw = benchmark_weekly.copy()
     sw.index = idx_s
@@ -366,10 +376,17 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         return None
 
     # --- 9. POSITIVE DUAL RELATIVE STRENGTH (vwRS) ---
-    vw_rs_mkt = rs_mkt_series.get(row.name, rs_mkt_series.iloc[-1]) if not rs_mkt_series.empty else 0.0
-    vw_rs_sec = rs_sec_series.get(row.name, rs_sec_series.iloc[-1]) if not rs_sec_series.empty else 0.0
+    # Both series must actually contain this week's date; if either is missing
+    # we skip the row rather than silently substituting a later reading, which
+    # would leak future data into a backtest.
+    if row.name not in rs_mkt_series.index or row.name not in rs_sec_series.index:
+        return None
 
-    if vw_rs_mkt < 0.0:  # Must outperform the broader market (Nifty 500)
+    vw_rs_mkt = rs_mkt_series.loc[row.name]
+    vw_rs_sec = rs_sec_series.loc[row.name]
+
+    # Must outperform BOTH the broader market (Nifty 500) AND the sector benchmark.
+    if vw_rs_mkt < 0.0 or vw_rs_sec < 0.0:
         return None
 
     # Distance from 52W High
@@ -434,8 +451,9 @@ def _build_scan_result(evald: dict) -> ScanResult:
 # Parallel Scanning Pipeline
 # ---------------------------------------------------------------------------
 
-def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, backtest: bool, lookback_weeks: int, weekly_cache: dict = None):
-    daily = _download_with_retry(f"{symbol}.NS", period="5y")
+def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, backtest: bool, lookback_weeks: int,
+                 weekly_cache: dict = None, request_delay: float = 0.0):
+    daily = _download_with_retry(f"{symbol}.NS", period="5y", request_delay=request_delay)
     if daily is None:
         return []
 
@@ -617,20 +635,26 @@ def main():
     sector_cache = {}
     print("Prefetching Sector Benchmarks...")
     for sec_name, sec_ticker in set(SECTOR_BENCHMARK_MAP.items()):
-        daily_sec = _download_with_retry(sec_ticker, period="5y")
+        daily_sec = _download_with_retry(sec_ticker, period="5y", request_delay=args.delay)
         if daily_sec is not None:
             wk = build_weekly(daily_sec)
             if wk is not None:
                 sector_cache[sec_ticker] = wk
 
     symbols = SYMBOLS[: args.limit] if args.limit else SYMBOLS
-    print(f"Scanning {len(symbols)} candidates with {args.workers} workers...")
+    print(f"Scanning {len(symbols)} candidates with {args.workers} workers (delay={args.delay}s/req)...")
 
     all_candidates: List[ScanResult] = []
     weekly_cache = {} if args.backtest else None
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(scan_symbol, s, market_weekly, sector_cache, args.backtest, args.lookback_weeks, weekly_cache): s for s in symbols}
+        futures = {
+            executor.submit(
+                scan_symbol, s, market_weekly, sector_cache, args.backtest, args.lookback_weeks,
+                weekly_cache, args.delay
+            ): s
+            for s in symbols
+        }
         for f in as_completed(futures):
             try:
                 res = f.result()
