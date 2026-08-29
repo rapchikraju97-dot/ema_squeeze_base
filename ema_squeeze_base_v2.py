@@ -304,7 +304,13 @@ def compute_volume_weighted_rs_series(stock_weekly: pd.DataFrame, benchmark_week
 # Setup Evaluator: Young Stage-2 Inception Engine
 # ---------------------------------------------------------------------------
 
-def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs_sec_series: pd.Series) -> Optional[dict]:
+def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs_sec_series: pd.Series,
+                         debug_counts: dict = None) -> Optional[dict]:
+    def _reject(stage: str):
+        if debug_counts is not None:
+            debug_counts[stage] = debug_counts.get(stage, 0) + 1
+        return None
+
     if idx < 45 or idx >= len(df):
         return None
 
@@ -313,7 +319,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
 
     # --- 1. CURRENT MOVING AVERAGE ALIGNMENT (10W > 20W > 40W) ---
     if pd.isna(row.ema40) or pd.isna(row.ema20) or pd.isna(row.ema10) or pd.isna(row.ema5):
-        return None
+        return _reject("1_missing_ema_data")
 
     ema40_prev4 = df.iloc[idx - 4]["ema40"]
     ema10_prev4 = df.iloc[idx - 4]["ema10"]
@@ -323,7 +329,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     bullish_stack = (row.ema5 >= row.ema10 * 0.98) and (row.ema10 > row.ema20) and (row.ema20 > row.ema40) and (row.close > row.ema40)
 
     if not (emas_rising and bullish_stack):
-        return None
+        return _reject("1_not_bullish_stack")
 
     # --- 2. FRESH CROSSOVER DETECTION (10W crossed 40W 10 to 26 weeks ago) ---
     crossover_idx = None
@@ -338,7 +344,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
             break
 
     if crossover_idx is None:
-        return None  # Rejects mature trends that crossed >26 weeks ago
+        return _reject("2_no_fresh_crossover")  # Rejects mature trends that crossed >26 weeks ago
 
     weeks_since_crossover = idx - crossover_idx
 
@@ -348,7 +354,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     initial_thrust_pct = ((highest_after_cross - cross_price) / cross_price) * 100
 
     if not (MIN_INITIAL_THRUST_PCT <= initial_thrust_pct <= MAX_INITIAL_THRUST_PCT):
-        return None  # Rejects weak crossovers (< +25%) or overextended blow-offs (> +85%)
+        return _reject("3_thrust_out_of_range")  # Rejects weak crossovers (< +25%) or overextended blow-offs (> +85%)
 
     # --- 3b. LONG-TERM OVERHANG CHECK ---
     # Look further back than the crossover for a pre-existing multi-year high.
@@ -362,47 +368,54 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     if prior_high is not None and pd.notna(prior_high) and prior_high > 0:
         overhang_pct = round((prior_high - row.close) / prior_high * 100, 2)
         if 0 <= overhang_pct <= MAX_PRIOR_HIGH_OVERHANG_PCT:
-            return None  # Too close to a pre-existing multi-year high — not a clean young inception
+            return _reject("3b_old_resistance_overhang")  # Too close to a pre-existing multi-year high
 
     # --- 4. YOUNG PROXIMITY GATE: RESTING NEAR 40W BASELINE ---
     # Rejects extended runners sitting far above 40W EMA (must be within 8% to 28%)
     dist_from_40w = (row.close - row.ema40) / row.ema40 * 100
     if not (MIN_DIST_FROM_40W_PCT <= dist_from_40w <= MAX_DIST_FROM_40W_PCT):
-        return None
+        return _reject("4_dist_from_40w_out_of_range")
 
     # --- 5. ZERO STRUCTURAL DAMAGE (40W EMA defended since crossover) ---
     cycle_lows = df["low"].iloc[crossover_idx: idx + 1]
     cycle_ema40 = df["ema40"].iloc[crossover_idx: idx + 1]
     if (cycle_lows < cycle_ema40 * 0.98).any():
-        return None  # Rejects broken/damaged charts
+        return _reject("5_structural_damage")  # Rejects broken/damaged charts
 
     # --- 6. SHALLOW 10W / 20W POCKET TOUCH ---
     touch_10w = (row.low <= row.ema10 * (1 + NEAR_EMA_TOLERANCE_PCT)) and (row.close >= row.ema20 * (1 - SUPPORT_CLOSE_TOLERANCE_PCT / 100))
     touch_20w = (row.low <= row.ema20 * (1 + NEAR_EMA_TOLERANCE_PCT)) and (row.close >= row.ema20 * (1 - SUPPORT_CLOSE_TOLERANCE_PCT / 100))
 
     if not (touch_10w or touch_20w):
-        return None
+        return _reject("6_no_ema_touch")
 
     pullback_ema = "10W" if abs(row.close - row.ema10) <= abs(row.close - row.ema20) else "20W"
 
     # --- 6b. PULLBACK SEQUENCE NUMBER ---
-    # Count distinct touch episodes of the 10W/20W EMA since the crossover
-    # (consecutive touching weeks count as one episode). Reject anything past
-    # the 2nd pullback — that's no longer a "young" trend.
-    prev_touch_flag = False
+    # Count distinct pullback episodes since the crossover using hysteresis:
+    # a new episode only starts once price has clearly moved AWAY from the
+    # EMAs first (close > 5% above 10W EMA), then comes back NEAR them (low
+    # within tolerance). A naive "near/not-near" flip-flop overcounts noise
+    # right after the crossover, when 10W/20W sit close together and price
+    # chops around them within a single real pullback.
+    state = "away"
     pullback_number = 0
     for j in range(crossover_idx, idx + 1):
         bar = df.iloc[j]
-        touch_flag = (bar.low <= bar.ema10 * (1 + NEAR_EMA_TOLERANCE_PCT)) or \
-                     (bar.low <= bar.ema20 * (1 + NEAR_EMA_TOLERANCE_PCT))
-        if touch_flag and not prev_touch_flag:
+        is_near = (bar.low <= bar.ema10 * (1 + NEAR_EMA_TOLERANCE_PCT)) or \
+                  (bar.low <= bar.ema20 * (1 + NEAR_EMA_TOLERANCE_PCT))
+        is_away = bar.close > bar.ema10 * 1.05
+        if is_near and state != "in_pullback":
             pullback_number += 1
-        prev_touch_flag = touch_flag
+            state = "in_pullback"
+        elif is_away:
+            state = "away"
+        # else: ambiguous zone — hold current state, don't flicker
 
     if pullback_number == 0:
         pullback_number = 1  # current bar is itself the touch in edge cases
     if pullback_number > MAX_PULLBACK_NUMBER:
-        return None  # 3rd+ pullback — trend is maturing, not young anymore
+        return _reject("6b_too_many_pullbacks")  # 3rd+ pullback — trend is maturing, not young anymore
 
     # --- 7. TIGHT CANDLE ANATOMY & LOWER WICK REJECTION ---
     candle_range = row.high - row.low
@@ -411,39 +424,39 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     is_tight_bar = bar_range_pct <= 7.0
 
     if not (upper_half_close or is_tight_bar):
-        return None
+        return _reject("7_loose_candle")
 
     # --- 8. DRY-UP ABSORPTION VOLUME SIGNATURE ---
     vol_avg = row.get("vol_sma10", 0)
     if pd.isna(vol_avg) or vol_avg <= 0:
-        return None
+        return _reject("8_no_volume_data")
 
     rvol = round(float(row.volume / vol_avg), 2)
     is_dry_absorption = (rvol <= VOL_ABSORPTION_MAX_RVOL)
     is_ignition_turn = (rvol >= HIGH_VOL_IGNITION_RATIO) and (row.close >= prev_row.high * 0.99)
 
     if not (is_dry_absorption or is_ignition_turn):
-        return None
+        return _reject("8_volume_signature_fail")
 
     # --- 9. POSITIVE DUAL RELATIVE STRENGTH (vwRS) ---
     # Both series must actually contain this week's date; if either is missing
     # we skip the row rather than silently substituting a later reading, which
     # would leak future data into a backtest.
     if row.name not in rs_mkt_series.index or row.name not in rs_sec_series.index:
-        return None
+        return _reject("9_missing_rs_data")
 
     vw_rs_mkt = rs_mkt_series.loc[row.name]
     vw_rs_sec = rs_sec_series.loc[row.name]
 
     # Must outperform BOTH the broader market (Nifty 500) AND the sector benchmark.
     if vw_rs_mkt < 0.0 or vw_rs_sec < 0.0:
-        return None
+        return _reject("9_rs_negative")
 
     # Distance from 52W High
     high_52w = row.get("high_52w", float("nan"))
     dist_off_52w = round((high_52w - row.close) / high_52w * 100, 2) if pd.notna(high_52w) and high_52w > 0 else 0.0
     if dist_off_52w > MAX_PCT_OFF_52W_HIGH:
-        return None
+        return _reject("9b_too_far_off_52w_high")
 
     stop_loss = round(min(row.low, prev_row.low) * 0.99, 2)
     risk_pct = round((row.close - stop_loss) / row.close * 100, 2)
@@ -506,7 +519,7 @@ def _build_scan_result(evald: dict) -> ScanResult:
 # ---------------------------------------------------------------------------
 
 def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, backtest: bool, lookback_weeks: int,
-                 weekly_cache: dict = None, request_delay: float = 0.0):
+                 weekly_cache: dict = None, request_delay: float = 0.0, debug_counts: dict = None):
     daily = _download_with_retry(f"{symbol}.NS", period="5y", request_delay=request_delay)
     if daily is None:
         return []
@@ -529,14 +542,14 @@ def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, ba
     if backtest:
         start_idx = max(45, len(weekly) - lookback_weeks)
         for i in range(start_idx, len(weekly)):
-            evald = evaluate_conditions(weekly, i, rs_mkt_series, rs_sec_series)
+            evald = evaluate_conditions(weekly, i, rs_mkt_series, rs_sec_series, debug_counts)
             if evald:
                 res = _build_scan_result(evald)
                 res.symbol = symbol
                 res.sector = sector
                 results.append(res)
     else:
-        evald = evaluate_conditions(weekly, len(weekly) - 1, rs_mkt_series, rs_sec_series)
+        evald = evaluate_conditions(weekly, len(weekly) - 1, rs_mkt_series, rs_sec_series, debug_counts)
         if evald:
             res = _build_scan_result(evald)
             res.symbol = symbol
@@ -677,6 +690,7 @@ def main():
     parser.add_argument("--no-log-history", action="store_true")
     parser.add_argument("--weekly-report", action="store_true")
     parser.add_argument("--report-lookback-weeks", type=int, default=8)
+    parser.add_argument("--debug", action="store_true", help="Print a rejection-reason breakdown across all scanned candidates.")
     args = parser.parse_args()
 
     print(f"Fetching Market Benchmark ({MARKET_INDEX_LABEL})...")
@@ -701,12 +715,28 @@ def main():
 
     all_candidates: List[ScanResult] = []
     weekly_cache = {} if args.backtest else None
+    debug_counts = {} if args.debug else None
+    debug_lock = threading.Lock() if args.debug else None
+
+    orig_evaluate = evaluate_conditions
+    if args.debug:
+        # Wrap evaluate_conditions so the shared debug_counts dict is updated
+        # under a lock — dict increments aren't guaranteed atomic across threads.
+        def locked_evaluate(df, idx, rs_mkt, rs_sec, _dc=debug_counts):
+            local_counts = {}
+            result = orig_evaluate(df, idx, rs_mkt, rs_sec, local_counts)
+            if local_counts:
+                with debug_lock:
+                    for k, v in local_counts.items():
+                        _dc[k] = _dc.get(k, 0) + v
+            return result
+        globals()["evaluate_conditions"] = locked_evaluate
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
                 scan_symbol, s, market_weekly, sector_cache, args.backtest, args.lookback_weeks,
-                weekly_cache, args.delay
+                weekly_cache, args.delay, debug_counts
             ): s
             for s in symbols
         }
@@ -716,6 +746,15 @@ def main():
                 all_candidates.extend(res)
             except Exception:
                 pass
+
+    if args.debug:
+        globals()["evaluate_conditions"] = orig_evaluate
+        print("\n[DEBUG] Rejection breakdown across all scanned weeks/symbols:")
+        if not debug_counts:
+            print("  (no rejections recorded — check that symbols downloaded successfully)")
+        else:
+            for stage, count in sorted(debug_counts.items(), key=lambda kv: -kv[1]):
+                print(f"  {stage:35s} {count}")
 
     msg = format_results_message(all_candidates)
     print("\n" + msg)
