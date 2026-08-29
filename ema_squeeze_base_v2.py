@@ -1,8 +1,8 @@
 """
-EMA Squeeze Base Scanner v2 — Stage-2 Absorption & Weekly Performance Engine
+EMA Squeeze Base Scanner v2 — Production Engine & Weekly Performance Tracker
 -----------------------------------------------------------------------------
 Commands:
-  1. Live Scan:           python ema_squeeze_base_v2.py
+  1. Live Weekly Scan:    python ema_squeeze_base_v2.py
   2. Weekly Report:       python ema_squeeze_base_v2.py --weekly-report --report-lookback-weeks 8
   3. Historical Backtest: python ema_squeeze_base_v2.py --backtest --lookback-weeks 52
 """
@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,28 +30,31 @@ from ta.trend import ADXIndicator
 # Strategy Parameters
 # ---------------------------------------------------------------------------
 
-NEAR_EMA_TOLERANCE_PCT = 0.028
-SUPPORT_CLOSE_TOLERANCE_PCT = 2.0
-MAX_PCT_OFF_52W_HIGH = 28.0
+NEAR_EMA_TOLERANCE_PCT = 0.028     # 2.8% proximity to 10W / 20W EMA pocket
+SUPPORT_CLOSE_TOLERANCE_PCT = 2.0  # Max buffer below 20W EMA line
+MAX_PCT_OFF_52W_HIGH = 28.0        # Max distance from 52W high
 
-MIN_WEEKS_SINCE_CROSSOVER = 8
-MAX_WEEKS_SINCE_CROSSOVER = 40
-MIN_INITIAL_THRUST_PCT = 22.0
-MAX_INITIAL_THRUST_PCT = 110.0
-MIN_DIST_FROM_40W_PCT = 6.0
-MAX_DIST_FROM_40W_PCT = 38.0
-MAX_EMA_SPREAD_PCT = 5.8
-MAX_PULLBACK_NUMBER = 4
+# Stage-2 Expansion & Base Bounds
+MIN_WEEKS_SINCE_CROSSOVER = 8      # Minimum maturity post-Stage 1 cross
+MAX_WEEKS_SINCE_CROSSOVER = 40     # Captures both Base-1 and Base-2 setups
+MIN_INITIAL_THRUST_PCT = 22.0      # Minimum impulse wave from crossover
+MAX_INITIAL_THRUST_PCT = 110.0     # Rejects blow-off tops
+MIN_DIST_FROM_40W_PCT = 6.0        # Separation above 40W baseline
+MAX_DIST_FROM_40W_PCT = 38.0       # Proximity ceiling (filters extended runners)
+MAX_EMA_SPREAD_PCT = 5.8           # 10W-20W spread compression limit
+MAX_PULLBACK_NUMBER = 4            # Permits up to Base-2 resets
 
-PRIOR_HIGH_LOOKBACK_WEEKS = 156
-MAX_PRIOR_HIGH_OVERHANG_PCT = 8.0
+# Long-Term Overhang Check
+PRIOR_HIGH_LOOKBACK_WEEKS = 156    # ~3 years measured before crossover
+MAX_PRIOR_HIGH_OVERHANG_PCT = 8.0  # Reject if sitting directly beneath multi-year resistance
 
-VOL_ABSORPTION_MAX_RVOL = 0.85
-HIGH_VOL_IGNITION_RATIO = 1.25
-TRAILING_VOL_WINDOW = 10
-RS_LOOKBACK_WEEKS = 12
+# Volume Signatures
+VOL_ABSORPTION_MAX_RVOL = 0.85     # Volume dry-up threshold during base rest
+HIGH_VOL_IGNITION_RATIO = 1.25     # Ignition volume on breakout turn
+TRAILING_VOL_WINDOW = 10           # Baseline volume lookback window
+RS_LOOKBACK_WEEKS = 12             # Rolling vwRS window
 
-MARKET_INDEX_TICKER = "^CRSLDX"
+MARKET_INDEX_TICKER = "^CRSLDX"    # Nifty 500
 MARKET_INDEX_LABEL = "Nifty 500"
 
 DOWNLOAD_RETRIES = 3
@@ -627,23 +630,39 @@ def generate_weekly_performance_report(lookback_weeks: int = 8) -> str:
     if not os.path.exists(MATCH_HISTORY_CSV):
         return (
             "📊 *EMA Squeeze Performance Report*\n\n"
-            "⚠️ No `match_history.csv` file found yet. Once live scans trigger matches, "
-            "this report will track their forward P&L, MFE, and Win Rate automatically."
+            "⚠️ No `match_history.csv` file found. Once matches are recorded, "
+            "this report tracks forward P&L, MFE, and Win Rate automatically."
         )
 
-    df_hist = pd.read_csv(MATCH_HISTORY_CSV)
+    try:
+        df_hist = pd.read_csv(MATCH_HISTORY_CSV, on_bad_lines="skip", engine="python")
+    except Exception:
+        try:
+            df_hist = pd.read_csv(MATCH_HISTORY_CSV, sep=None, engine="python", on_bad_lines="skip")
+        except Exception as e:
+            return f"📊 *EMA Squeeze Performance Report*\n\n⚠️ Error reading match history: {e}"
+
     if df_hist.empty:
         return "📊 *EMA Squeeze Performance Report*\n\nNo matched trades recorded in history."
 
-    # Parse and filter matches within lookback window
-    cutoff_date = (datetime.now() - timedelta(weeks=lookback_weeks)).strftime("%Y-%m-%d")
-    df_recent = df_hist[df_hist["week_date"] >= cutoff_date].copy()
+    df_hist.columns = [c.strip().lower() for c in df_hist.columns]
+
+    req_cols = ["symbol", "week_date", "close_at_match"]
+    if not all(col in df_hist.columns for col in req_cols):
+        return "📊 *EMA Squeeze Performance Report*\n\n⚠️ `match_history.csv` is missing required base columns."
+
+    try:
+        df_hist["parsed_date"] = pd.to_datetime(df_hist["week_date"], errors="coerce")
+        cutoff_dt = pd.Timestamp.now().normalize() - pd.Timedelta(weeks=lookback_weeks)
+        df_recent = df_hist[df_hist["parsed_date"] >= cutoff_dt].copy()
+    except Exception:
+        df_recent = df_hist.tail(20).copy()
 
     if df_recent.empty:
         return (
-            f"📊 *EMA Squeeze Performance Report*\n"
+            f"📊 *EMA SQUEEZE PERFORMANCE REPORT* 📊\n"
             f"📅 Period: Past {lookback_weeks} Weeks\n\n"
-            f"No matches were triggered in the last {lookback_weeks} weeks."
+            f"No matches logged in the last {lookback_weeks} weeks."
         )
 
     print(f"[INFO] Evaluating forward performance for {len(df_recent)} historical matches...")
@@ -656,11 +675,22 @@ def generate_weekly_performance_report(lookback_weeks: int = 8) -> str:
     winners_count = 0
 
     for _, row in df_recent.iterrows():
-        sym = row["symbol"]
-        match_date = row["week_date"]
-        entry_price = float(row["close_at_match"])
-        stop_loss = float(row["stop_loss_at_match"])
-        risk_pct = float(row["risk_pct_at_match"]) if pd.notna(row["risk_pct_at_match"]) else 4.0
+        sym = str(row["symbol"]).strip()
+        match_date_str = str(row["week_date"]).strip()
+
+        try:
+            entry_price = float(row["close_at_match"])
+        except (ValueError, TypeError):
+            continue
+
+        if "stop_loss_at_match" in row and pd.notna(row["stop_loss_at_match"]):
+            try:
+                stop_loss = float(row["stop_loss_at_match"])
+            except (ValueError, TypeError):
+                stop_loss = round(entry_price * 0.95, 2)
+        else:
+            stop_loss = round(entry_price * 0.95, 2)
+
         risk_amount = max(0.01, entry_price - stop_loss)
 
         daily = _download_with_retry(f"{sym}.NS", period="2y")
@@ -668,16 +698,18 @@ def generate_weekly_performance_report(lookback_weeks: int = 8) -> str:
             continue
 
         weekly = build_weekly(daily)
-        if weekly is None:
+        if weekly is None or weekly.empty:
             continue
 
-        # Forward price slices after the match date
-        forward_bars = weekly[weekly.index >= match_date]
+        match_ts = pd.to_datetime(match_date_str).tz_localize(None)
+        weekly_idx = pd.to_datetime(weekly.index).tz_localize(None)
+        forward_bars = weekly[weekly_idx >= match_ts]
+
         if forward_bars.empty:
-            continue
+            forward_bars = weekly.tail(1)
 
         current_price = round(forward_bars["close"].iloc[-1], 2)
-        current_ema10 = round(forward_bars["ema10"].iloc[-1], 2)
+        current_ema10 = round(forward_bars["ema10"].iloc[-1], 2) if "ema10" in forward_bars else 0.0
         lowest_since = forward_bars["low"].min()
         highest_since = forward_bars["high"].max()
 
@@ -688,7 +720,7 @@ def generate_weekly_performance_report(lookback_weeks: int = 8) -> str:
         is_stopped_out = lowest_since <= stop_loss
         if is_stopped_out:
             stopped_out_count += 1
-            status_str = "🛑 STOPPED OUT"
+            status_str = "🛑 STOPPED"
         else:
             if pnl_pct > 0:
                 winners_count += 1
@@ -699,10 +731,10 @@ def generate_weekly_performance_report(lookback_weeks: int = 8) -> str:
         r_multiples.append(r_mult)
 
         trade_reports.append(
-            f"⭐ *{sym}* (Matched: `{match_date}` @ ₹{entry_price:.2f})\n"
-            f"   • Status: *{status_str}* | Close: ₹{current_price:.2f} (*{pnl_pct:+.1f}%*)\n"
-            f"   • Peak MFE: *+{mfe_pct:.1f}%* | Current R-Multiple: *{r_mult:+.1f}R*\n"
-            f"   • SL Anchor: ₹{stop_loss:.2f} | 10W Trailing Support: ₹{current_ema10:.2f}\n"
+            f"⭐ *{sym}* (Matched: `{match_date_str}` @ ₹{entry_price:.2f})\n"
+            f"   • Status: *{status_str}* | Current: ₹{current_price:.2f} (*{pnl_pct:+.1f}%*)\n"
+            f"   • Peak MFE: *+{mfe_pct:.1f}%* | R-Multiple: *{r_mult:+.1f}R*\n"
+            f"   • SL Anchor: ₹{stop_loss:.2f} | 10W Support: ₹{current_ema10:.2f}\n"
         )
 
     total_trades = len(pnls)
@@ -715,15 +747,15 @@ def generate_weekly_performance_report(lookback_weeks: int = 8) -> str:
     win_rate = (winners_count / total_trades) * 100
 
     report_lines = [
-        "📊 *EMA SQUEEZE WEEKLY PERFORMANCE REPORT* 📊",
+        "📊 *EMA SQUEEZE PERFORMANCE REPORT* 📊",
         f"📅 Date: {datetime.now().strftime('%Y-%m-%d')} | Lookback: *{lookback_weeks} Weeks*\n",
-        "📈 *EXECUTIVE SUMMARY*",
+        "📈 *PORTFOLIO SUMMARY*",
         f"• Total Setups Tracked: *{total_trades}*",
-        f"• Win Rate: *{win_rate:.1f}%* ({winners_count} profitable, {stopped_out_count} stopped)",
-        f"• Average Current P&L: *{avg_pnl:+.2f}%*",
-        f"• Average Peak Upside (MFE): *+{avg_mfe:.2f}%*",
-        f"• Total Cumulative R-Return: *{total_r:+.2f}R*\n",
-        "🎯 *INDIVIDUAL POSITION STATUS*"
+        f"• Win Rate: *{win_rate:.1f}%* ({winners_count} winning, {stopped_out_count} stopped)",
+        f"• Average Open P&L: *{avg_pnl:+.2f}%*",
+        f"• Average Peak MFE: *+{avg_mfe:.2f}%*",
+        f"• Total Cumulative Return: *{total_r:+.2f}R*\n",
+        "🎯 *POSITION BREAKDOWN*"
     ]
     report_lines.extend(trade_reports)
     return "\n".join(report_lines)
@@ -808,9 +840,12 @@ def send_telegram_message(text: str):
 def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HISTORY_CSV):
     existing_keys = set()
     if os.path.exists(csv_path):
-        with open(csv_path, "r", newline="") as f:
-            for row in csv.DictReader(f):
-                existing_keys.add((row.get("symbol", ""), row.get("week_date", "")))
+        try:
+            with open(csv_path, "r", newline="") as f:
+                for row in csv.DictReader(f):
+                    existing_keys.add((row.get("symbol", ""), row.get("week_date", "")))
+        except Exception:
+            pass
 
     new_rows = []
     run_date = datetime.now().strftime("%Y-%m-%d")
@@ -864,7 +899,7 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Print rejection breakdown.")
     args = parser.parse_args()
 
-    # --- MODE 1: WEEKLY REPORT DISPATCH ---
+    # MODE 1: PERFORMANCE REPORT
     if args.weekly_report:
         report_msg = generate_weekly_performance_report(lookback_weeks=args.report_lookback_weeks)
         print("\n" + report_msg)
@@ -872,7 +907,7 @@ def main():
             send_telegram_message(report_msg)
         return
 
-    # --- MODE 2: LIVE SCANNER DISPATCH ---
+    # MODE 2: LIVE WEEKLY SCANNER
     print(f"Fetching Market Benchmark ({MARKET_INDEX_LABEL})...")
     market_daily = _download_with_retry(MARKET_INDEX_TICKER, period="5y")
     market_weekly = build_weekly(market_daily) if market_daily is not None else None
