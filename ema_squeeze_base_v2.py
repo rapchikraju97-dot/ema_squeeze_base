@@ -1,8 +1,12 @@
 """
-EMA Squeeze Base Scanner v2 — NIFTY TOTAL MARKET (750 Stocks)
---------------------------------------------------------------
-Targets Young Stage-2 Inception & Base-1 Absorption Setups across the entire
-Nifty Total Market Universe (Large, Mid, Small, and Micro-Caps).
+EMA Squeeze Base Scanner v2 — Stage-2 (Base-1 & Base-2) Absorption Engine
+-------------------------------------------------------------------------
+Coverage: Nifty Total Market (750 Equities)
+Captures:
+  1. Base-1 Inceptions (10–26w post-crossover)
+  2. Base-2 Structural Consolidations (26–40w post-crossover)
+  3. Absorption Volume Dry-up (RVOL <= 0.85x) & Breakout Pivots (RVOL >= 1.25x)
+  4. Continuous 40W EMA Defense + Positive Dual Rolling vwRS (Market & Sector)
 """
 
 import argparse
@@ -25,32 +29,32 @@ from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator
 
 # ---------------------------------------------------------------------------
-# Young Trend Inception Parameters
+# Calibrated Strategy Parameters (Base-1 + Base-2 Coverage)
 # ---------------------------------------------------------------------------
 
-NEAR_EMA_TOLERANCE_PCT = 0.025     # 2.5% proximity to 10W / 20W EMA
-SUPPORT_CLOSE_TOLERANCE_PCT = 1.5  # Max buffer below 20W EMA line
-MAX_PCT_OFF_52W_HIGH = 25.0        # Tight distance from recent highs
+NEAR_EMA_TOLERANCE_PCT = 0.028     # 2.8% proximity to 10W / 20W EMA pocket
+SUPPORT_CLOSE_TOLERANCE_PCT = 2.0  # Max buffer below 20W EMA line
+MAX_PCT_OFF_52W_HIGH = 28.0        # Tight distance from recent 52W highs
 
-# Young Base-1 Bounds (Strictly rejects mature trends)
-MIN_WEEKS_SINCE_CROSSOVER = 10     # Must have completed initial impulse thrust
-MAX_WEEKS_SINCE_CROSSOVER = 26     # Rejects trends older than ~6 months
-MIN_INITIAL_THRUST_PCT = 25.0      # Minimum impulse wave (+25%) from crossover
-MAX_INITIAL_THRUST_PCT = 85.0      # Rejects climax blow-offs (> +85%)
-MIN_DIST_FROM_40W_PCT = 8.0        # Must have clear separation from 40W
-MAX_DIST_FROM_40W_PCT = 28.0       # Must NOT be extended far above 40W baseline
-MAX_EMA_SPREAD_PCT = 5.0           # 10W-20W spread must be tightly coiled
+# Stage-2 Expansion & Base Bounds
+MIN_WEEKS_SINCE_CROSSOVER = 8      # Minimum maturity post-Stage 1 cross
+MAX_WEEKS_SINCE_CROSSOVER = 40     # Captures both Base-1 and Base-2 setups
+MIN_INITIAL_THRUST_PCT = 22.0      # Minimum impulse wave from crossover
+MAX_INITIAL_THRUST_PCT = 110.0     # Rejects blow-off tops
+MIN_DIST_FROM_40W_PCT = 6.0        # Separation above 40W baseline
+MAX_DIST_FROM_40W_PCT = 38.0       # Proximity ceiling (filters extended runners)
+MAX_EMA_SPREAD_PCT = 5.8           # 10W-20W spread compression limit
+MAX_PULLBACK_NUMBER = 4            # Permits up to Base-2 resets
 
-# Long-Term Overhang / Prior-High Check
-PRIOR_HIGH_LOOKBACK_WEEKS = 156    # ~3 years, measured BEFORE the crossover
-MAX_PRIOR_HIGH_OVERHANG_PCT = 8.0  # Reject if within 8% below a pre-existing multi-year high
-MAX_PULLBACK_NUMBER = 2            # Only accept 1st or 2nd pullback
+# Long-Term Overhang Check
+PRIOR_HIGH_LOOKBACK_WEEKS = 156    # ~3 years measured before crossover
+MAX_PRIOR_HIGH_OVERHANG_PCT = 8.0  # Reject if sitting directly beneath multi-year resistance
 
 # Volume Signatures
-VOL_ABSORPTION_MAX_RVOL = 0.80     # Volume dry-up threshold during base rest
+VOL_ABSORPTION_MAX_RVOL = 0.85     # Volume dry-up threshold during base rest
 HIGH_VOL_IGNITION_RATIO = 1.25     # Ignition volume on breakout turn
-TRAILING_VOL_WINDOW = 10           # Lookback window for volume baseline
-RS_LOOKBACK_WEEKS = 12             # Rolling vwRS lookback window
+TRAILING_VOL_WINDOW = 10           # Baseline volume lookback window
+RS_LOOKBACK_WEEKS = 12             # Rolling vwRS window
 
 MARKET_INDEX_TICKER = "^CRSLDX"    # Nifty 500
 MARKET_INDEX_LABEL = "Nifty 500"
@@ -72,7 +76,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 # ---------------------------------------------------------------------------
-# Sector Benchmarks & Nifty Total Market 750 Universe
+# Sector Benchmarks & Universe
 # ---------------------------------------------------------------------------
 
 SECTOR_BENCHMARK_MAP = {
@@ -89,7 +93,6 @@ SECTOR_BENCHMARK_MAP = {
     "Consumer Durables": "^CNXCONSUM",
 }
 
-# Full 750 Stock Universe (Nifty Total Market Universe)
 SYMBOLS = [
     "360ONE", "3MINDIA", "ABB", "ACC", "ACMESOLAR", "AIAENG", "APLAPOLLO", "ASKAUTOLTD",
     "AUBANK", "AWL", "AXISCADES", "AADHARHFC", "AARTIDRUGS", "AARTIIND", "AARTIPHARM", "AAVAS",
@@ -378,7 +381,7 @@ def compute_volume_weighted_rs_series(stock_weekly: pd.DataFrame, benchmark_week
     return rs_series.dropna()
 
 # ---------------------------------------------------------------------------
-# Setup Evaluator: Young Stage-2 Inception Engine
+# Setup Evaluator: Base-1 & Base-2 Absorption Engine
 # ---------------------------------------------------------------------------
 
 def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs_sec_series: pd.Series,
@@ -408,7 +411,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     if not (emas_rising and bullish_stack):
         return _reject("1_not_bullish_stack")
 
-    # --- 2. FRESH CROSSOVER DETECTION (10W crossed 40W 10 to 26 weeks ago) ---
+    # --- 2. FRESH CROSSOVER DETECTION (10W crossed 40W 8 to 40 weeks ago) ---
     crossover_idx = None
     lookback_start = max(1, idx - MAX_WEEKS_SINCE_CROSSOVER)
     lookback_end = max(1, idx - MIN_WEEKS_SINCE_CROSSOVER)
@@ -421,11 +424,11 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
             break
 
     if crossover_idx is None:
-        return _reject("2_no_fresh_crossover")
+        return _reject("2_no_crossover_in_window")
 
     weeks_since_crossover = idx - crossover_idx
 
-    # --- 3. FIRST EXPANSION THRUST (+25% to +85% move from cross) ---
+    # --- 3. FIRST EXPANSION THRUST (+22% to +110% move from cross) ---
     cross_price = df.iloc[crossover_idx]["close"]
     highest_after_cross = df["high"].iloc[crossover_idx: idx + 1].max()
     initial_thrust_pct = ((highest_after_cross - cross_price) / cross_price) * 100
@@ -443,7 +446,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         if 0 <= overhang_pct <= MAX_PRIOR_HIGH_OVERHANG_PCT:
             return _reject("3b_old_resistance_overhang")
 
-    # --- 4. YOUNG PROXIMITY GATE: RESTING NEAR 40W BASELINE ---
+    # --- 4. PROXIMITY GATE: RESTING NEAR 40W BASELINE ---
     dist_from_40w = (row.close - row.ema40) / row.ema40 * 100
     if not (MIN_DIST_FROM_40W_PCT <= dist_from_40w <= MAX_DIST_FROM_40W_PCT):
         return _reject("4_dist_from_40w_out_of_range")
@@ -485,12 +488,12 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     candle_range = row.high - row.low
     bar_range_pct = (candle_range / row.close) * 100 if row.close > 0 else 10.0
     upper_half_close = (row.close >= row.low + (candle_range * 0.35)) if candle_range > 0 else True
-    is_tight_bar = bar_range_pct <= 7.0
+    is_tight_bar = bar_range_pct <= 7.5
 
     if not (upper_half_close or is_tight_bar):
         return _reject("7_loose_candle")
 
-    # --- 8. DRY-UP ABSORPTION VOLUME SIGNATURE ---
+    # --- 8. VOLUME DRY-UP ABSORPTION vs IGNITION ---
     vol_avg = row.get("vol_sma10", 0)
     if pd.isna(vol_avg) or vol_avg <= 0:
         return _reject("8_no_volume_data")
@@ -521,6 +524,9 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     risk_pct = round((row.close - stop_loss) / row.close * 100, 2)
     ema_spread_pct = round(abs(row.ema10 - row.ema20) / row.close * 100, 2)
 
+    base_label = "Base-1" if weeks_since_crossover <= 24 else "Base-2"
+    setup_label = f"🔥 {base_label} Breakout Pivot" if is_ignition_turn else f"🛡️ {base_label} Absorption Pocket"
+
     return {
         "row": row,
         "pullback_ema": pullback_ema,
@@ -536,7 +542,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         "dist_from_40w_pct": round(dist_from_40w, 1),
         "prior_high_overhang_pct": overhang_pct,
         "pullback_number": pullback_number,
-        "setup_type": "🔥 Base-1 Inception Pivot" if is_ignition_turn else "🛡️ Base-1 Shallow Absorption",
+        "setup_type": setup_label,
     }
 
 def _build_scan_result(evald: dict) -> ScanResult:
@@ -623,20 +629,20 @@ def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, ba
 
 def format_results_message(buy_setups: List[ScanResult]) -> str:
     lines = [
-        "⚡ *5-10-20-40 Weekly EMA Young Base-1 Scanner (Total Market)* ⚡",
+        "⚡ *5-10-20-40 Weekly EMA Absorption Scanner (Stage-2)* ⚡",
         f"📅 Date: {datetime.now().strftime('%Y-%m-%d')}\n"
     ]
     if not buy_setups:
-        lines.append("No candidates passed all strict young Stage-2 inception filters this week across Nifty Total Market.")
+        lines.append("No candidates passed all Stage-2 absorption filters this week across Nifty Total Market.")
         return "\n".join(lines)
 
-    lines.append(f"🎯 *YOUNG BASE-1 OPPORTUNITIES ({len(buy_setups)})*\n")
+    lines.append(f"🎯 *QUALIFIED STAGE-2 SETUPS ({len(buy_setups)})*\n")
     for r in buy_setups:
         lines.append(
             f"⭐ *{r.symbol}* [{r.sector}] — `{r.setup_type}`\n"
             f"   • Close: ₹{r.close} | Support: *{r.pullback_ema} EMA* | Spread: {r.ema_spread_pct}%\n"
             f"   • Crossover Age: *{r.weeks_since_crossover}w ago* (Initial Thrust: +{r.post_cross_gain_pct}%)\n"
-            f"   • Pullback #: *{r.pullback_number}* | Proximity to 40W: *+{r.dist_from_40w_pct}%* (Young)\n"
+            f"   • Pullback #: *{r.pullback_number}* | Proximity to 40W: *+{r.dist_from_40w_pct}%*\n"
             f"   • Prior-High Overhang: *{r.prior_high_overhang_pct:+.1f}%*\n"
             f"   • RVOL: *{r.breakout_vol_ratio}x* | RSI: {r.rsi14} | ADX: {r.adx14}\n"
             f"   • vwRS (vs Nifty 500): *{r.rs_vs_market_pct:+.1f}* | vs Sector: *{r.rs_vs_sector_pct:+.1f}*\n"
