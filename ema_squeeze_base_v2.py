@@ -1,13 +1,10 @@
 """
-EMA Squeeze Base Scanner v2 — Stage-2 (Base-1 & Base-2) Absorption Engine
--------------------------------------------------------------------------
-Coverage: Nifty Total Market (750 Equities)
-Features:
-  1. Base-1 Inceptions (8–24w post-crossover) & Base-2 Resets (25–40w post-crossover).
-  2. Absorption Volume Dry-up (RVOL <= 0.85x) vs Breakout Turns (RVOL >= 1.25x).
-  3. Continuous 40W EMA Defense + Zero Overhead Structural Damage.
-  4. Dynamic vwRS: Evaluates Stock vs Nifty 500 and Sector Index (skips gracefully if unassigned).
-  5. Thread-safe debugging diagnostics and multi-chunk Telegram alerts.
+EMA Squeeze Base Scanner v2 — Stage-2 Absorption & Weekly Performance Engine
+-----------------------------------------------------------------------------
+Commands:
+  1. Live Scan:           python ema_squeeze_base_v2.py
+  2. Weekly Report:       python ema_squeeze_base_v2.py --weekly-report --report-lookback-weeks 8
+  3. Historical Backtest: python ema_squeeze_base_v2.py --backtest --lookback-weeks 52
 """
 
 import argparse
@@ -19,8 +16,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,34 +27,31 @@ from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator
 
 # ---------------------------------------------------------------------------
-# Strategy Parameters (Base-1 + Base-2 Coverage)
+# Strategy Parameters
 # ---------------------------------------------------------------------------
 
-NEAR_EMA_TOLERANCE_PCT = 0.028     # 2.8% proximity to 10W / 20W EMA pocket
-SUPPORT_CLOSE_TOLERANCE_PCT = 2.0  # Max buffer below 20W EMA line
-MAX_PCT_OFF_52W_HIGH = 28.0        # Max distance from 52W high
+NEAR_EMA_TOLERANCE_PCT = 0.028
+SUPPORT_CLOSE_TOLERANCE_PCT = 2.0
+MAX_PCT_OFF_52W_HIGH = 28.0
 
-# Stage-2 Expansion & Base Bounds
-MIN_WEEKS_SINCE_CROSSOVER = 8      # Minimum maturity post-Stage 1 cross
-MAX_WEEKS_SINCE_CROSSOVER = 40     # Captures both Base-1 and Base-2 setups
-MIN_INITIAL_THRUST_PCT = 22.0      # Minimum impulse wave from crossover
-MAX_INITIAL_THRUST_PCT = 110.0     # Rejects blow-off tops
-MIN_DIST_FROM_40W_PCT = 6.0        # Separation above 40W baseline
-MAX_DIST_FROM_40W_PCT = 38.0       # Proximity ceiling (filters extended runners)
-MAX_EMA_SPREAD_PCT = 5.8           # 10W-20W spread compression limit
-MAX_PULLBACK_NUMBER = 4            # Permits up to Base-2 resets
+MIN_WEEKS_SINCE_CROSSOVER = 8
+MAX_WEEKS_SINCE_CROSSOVER = 40
+MIN_INITIAL_THRUST_PCT = 22.0
+MAX_INITIAL_THRUST_PCT = 110.0
+MIN_DIST_FROM_40W_PCT = 6.0
+MAX_DIST_FROM_40W_PCT = 38.0
+MAX_EMA_SPREAD_PCT = 5.8
+MAX_PULLBACK_NUMBER = 4
 
-# Long-Term Overhang Check
-PRIOR_HIGH_LOOKBACK_WEEKS = 156    # ~3 years measured before crossover
-MAX_PRIOR_HIGH_OVERHANG_PCT = 8.0  # Reject if sitting directly beneath multi-year resistance
+PRIOR_HIGH_LOOKBACK_WEEKS = 156
+MAX_PRIOR_HIGH_OVERHANG_PCT = 8.0
 
-# Volume Signatures
-VOL_ABSORPTION_MAX_RVOL = 0.85     # Volume dry-up threshold during base rest
-HIGH_VOL_IGNITION_RATIO = 1.25     # Ignition volume on breakout turn
-TRAILING_VOL_WINDOW = 10           # Baseline volume lookback window
-RS_LOOKBACK_WEEKS = 12             # Rolling vwRS window
+VOL_ABSORPTION_MAX_RVOL = 0.85
+HIGH_VOL_IGNITION_RATIO = 1.25
+TRAILING_VOL_WINDOW = 10
+RS_LOOKBACK_WEEKS = 12
 
-MARKET_INDEX_TICKER = "^CRSLDX"    # Nifty 500
+MARKET_INDEX_TICKER = "^CRSLDX"
 MARKET_INDEX_LABEL = "Nifty 500"
 
 DOWNLOAD_RETRIES = 3
@@ -76,7 +70,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 # ---------------------------------------------------------------------------
-# Sector Benchmarks & Universe Mapping
+# Sector Benchmarks & Universe
 # ---------------------------------------------------------------------------
 
 SECTOR_BENCHMARK_MAP = {
@@ -404,7 +398,6 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     ema40_prev4 = df.iloc[idx - 4]["ema40"]
     ema10_prev4 = df.iloc[idx - 4]["ema10"]
 
-    # 40W and 10W EMAs must be actively rising
     emas_rising = (row.ema40 >= ema40_prev4) and (row.ema10 >= ema10_prev4)
     bullish_stack = (row.ema5 >= row.ema10 * 0.98) and (row.ema10 > row.ema20) and (row.ema20 > row.ema40) and (row.close > row.ema40)
 
@@ -466,7 +459,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
 
     pullback_ema = "10W" if abs(row.close - row.ema10) <= abs(row.close - row.ema20) else "20W"
 
-    # --- 6b. PULLBACK SEQUENCE NUMBER (Hysteresis model) ---
+    # --- 6b. PULLBACK SEQUENCE NUMBER ---
     state = "away"
     pullback_number = 0
     for j in range(crossover_idx, idx + 1):
@@ -506,12 +499,10 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         return _reject("8_volume_signature_fail")
 
     # --- 9. RELATIVE STRENGTH (vwRS) ---
-    # Market RS is strictly mandatory (must be non-negative)
     vw_rs_mkt = rs_mkt_series.asof(row.name) if not rs_mkt_series.empty else np.nan
     if pd.isna(vw_rs_mkt) or vw_rs_mkt < 0.0:
         return _reject("9_rs_market_negative")
 
-    # Sector RS check is executed ONLY if a valid sector series exists
     vw_rs_sec = None
     if rs_sec_series is not None and not rs_sec_series.empty:
         sec_val = rs_sec_series.asof(row.name)
@@ -520,7 +511,6 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
                 return _reject("9_rs_sector_negative")
             vw_rs_sec = float(sec_val)
 
-    # Distance from 52W High
     high_52w = row.get("high_52w", float("nan"))
     dist_off_52w = round((high_52w - row.close) / high_52w * 100, 2) if pd.notna(high_52w) and high_52w > 0 else 0.0
     if dist_off_52w > MAX_PCT_OFF_52W_HIGH:
@@ -628,6 +618,115 @@ def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, ba
             results.append(res)
 
     return results
+
+# ---------------------------------------------------------------------------
+# Performance Tracking & Weekly Report Engine
+# ---------------------------------------------------------------------------
+
+def generate_weekly_performance_report(lookback_weeks: int = 8) -> str:
+    if not os.path.exists(MATCH_HISTORY_CSV):
+        return (
+            "📊 *EMA Squeeze Performance Report*\n\n"
+            "⚠️ No `match_history.csv` file found yet. Once live scans trigger matches, "
+            "this report will track their forward P&L, MFE, and Win Rate automatically."
+        )
+
+    df_hist = pd.read_csv(MATCH_HISTORY_CSV)
+    if df_hist.empty:
+        return "📊 *EMA Squeeze Performance Report*\n\nNo matched trades recorded in history."
+
+    # Parse and filter matches within lookback window
+    cutoff_date = (datetime.now() - timedelta(weeks=lookback_weeks)).strftime("%Y-%m-%d")
+    df_recent = df_hist[df_hist["week_date"] >= cutoff_date].copy()
+
+    if df_recent.empty:
+        return (
+            f"📊 *EMA Squeeze Performance Report*\n"
+            f"📅 Period: Past {lookback_weeks} Weeks\n\n"
+            f"No matches were triggered in the last {lookback_weeks} weeks."
+        )
+
+    print(f"[INFO] Evaluating forward performance for {len(df_recent)} historical matches...")
+
+    trade_reports = []
+    pnls = []
+    mfes = []
+    r_multiples = []
+    stopped_out_count = 0
+    winners_count = 0
+
+    for _, row in df_recent.iterrows():
+        sym = row["symbol"]
+        match_date = row["week_date"]
+        entry_price = float(row["close_at_match"])
+        stop_loss = float(row["stop_loss_at_match"])
+        risk_pct = float(row["risk_pct_at_match"]) if pd.notna(row["risk_pct_at_match"]) else 4.0
+        risk_amount = max(0.01, entry_price - stop_loss)
+
+        daily = _download_with_retry(f"{sym}.NS", period="2y")
+        if daily is None or daily.empty:
+            continue
+
+        weekly = build_weekly(daily)
+        if weekly is None:
+            continue
+
+        # Forward price slices after the match date
+        forward_bars = weekly[weekly.index >= match_date]
+        if forward_bars.empty:
+            continue
+
+        current_price = round(forward_bars["close"].iloc[-1], 2)
+        current_ema10 = round(forward_bars["ema10"].iloc[-1], 2)
+        lowest_since = forward_bars["low"].min()
+        highest_since = forward_bars["high"].max()
+
+        pnl_pct = round(((current_price - entry_price) / entry_price) * 100, 2)
+        mfe_pct = round(((highest_since - entry_price) / entry_price) * 100, 2)
+        r_mult = round((current_price - entry_price) / risk_amount, 2)
+
+        is_stopped_out = lowest_since <= stop_loss
+        if is_stopped_out:
+            stopped_out_count += 1
+            status_str = "🛑 STOPPED OUT"
+        else:
+            if pnl_pct > 0:
+                winners_count += 1
+            status_str = "✅ ACTIVE"
+
+        pnls.append(pnl_pct)
+        mfes.append(mfe_pct)
+        r_multiples.append(r_mult)
+
+        trade_reports.append(
+            f"⭐ *{sym}* (Matched: `{match_date}` @ ₹{entry_price:.2f})\n"
+            f"   • Status: *{status_str}* | Close: ₹{current_price:.2f} (*{pnl_pct:+.1f}%*)\n"
+            f"   • Peak MFE: *+{mfe_pct:.1f}%* | Current R-Multiple: *{r_mult:+.1f}R*\n"
+            f"   • SL Anchor: ₹{stop_loss:.2f} | 10W Trailing Support: ₹{current_ema10:.2f}\n"
+        )
+
+    total_trades = len(pnls)
+    if total_trades == 0:
+        return "Could not retrieve live price data for historical matches."
+
+    avg_pnl = np.mean(pnls)
+    avg_mfe = np.mean(mfes)
+    total_r = np.sum(r_multiples)
+    win_rate = (winners_count / total_trades) * 100
+
+    report_lines = [
+        "📊 *EMA SQUEEZE WEEKLY PERFORMANCE REPORT* 📊",
+        f"📅 Date: {datetime.now().strftime('%Y-%m-%d')} | Lookback: *{lookback_weeks} Weeks*\n",
+        "📈 *EXECUTIVE SUMMARY*",
+        f"• Total Setups Tracked: *{total_trades}*",
+        f"• Win Rate: *{win_rate:.1f}%* ({winners_count} profitable, {stopped_out_count} stopped)",
+        f"• Average Current P&L: *{avg_pnl:+.2f}%*",
+        f"• Average Peak Upside (MFE): *+{avg_mfe:.2f}%*",
+        f"• Total Cumulative R-Return: *{total_r:+.2f}R*\n",
+        "🎯 *INDIVIDUAL POSITION STATUS*"
+    ]
+    report_lines.extend(trade_reports)
+    return "\n".join(report_lines)
 
 # ---------------------------------------------------------------------------
 # Output & Auto-Chunking Telegram Delivery
@@ -760,11 +859,20 @@ def main():
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--no-log-history", action="store_true")
-    parser.add_argument("--weekly-report", action="store_true")
-    parser.add_argument("--report-lookback-weeks", type=int, default=8)
-    parser.add_argument("--debug", action="store_true", help="Print rejection-reason breakdown across scanned candidates.")
+    parser.add_argument("--weekly-report", action="store_true", help="Generate performance report for logged matches.")
+    parser.add_argument("--report-lookback-weeks", type=int, default=8, help="Lookback window for weekly report.")
+    parser.add_argument("--debug", action="store_true", help="Print rejection breakdown.")
     args = parser.parse_args()
 
+    # --- MODE 1: WEEKLY REPORT DISPATCH ---
+    if args.weekly_report:
+        report_msg = generate_weekly_performance_report(lookback_weeks=args.report_lookback_weeks)
+        print("\n" + report_msg)
+        if not args.dry_run:
+            send_telegram_message(report_msg)
+        return
+
+    # --- MODE 2: LIVE SCANNER DISPATCH ---
     print(f"Fetching Market Benchmark ({MARKET_INDEX_LABEL})...")
     market_daily = _download_with_retry(MARKET_INDEX_TICKER, period="5y")
     market_weekly = build_weekly(market_daily) if market_daily is not None else None
