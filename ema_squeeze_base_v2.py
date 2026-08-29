@@ -46,6 +46,21 @@ MIN_DIST_FROM_40W_PCT = 8.0        # Must have clear separation from 40W
 MAX_DIST_FROM_40W_PCT = 28.0       # Must NOT be extended far above 40W baseline
 MAX_EMA_SPREAD_PCT = 5.0           # 10W-20W spread must be tightly coiled
 
+# Long-Term Overhang / Prior-High Check
+# Avoids "young crossover, old resistance" traps — a stock can pass the
+# crossover-age and 52-week-high checks while still running straight into a
+# multi-year distribution zone from a prior cycle (e.g. a 2024 top the stock
+# is only now re-approaching). This looks further back than the crossover
+# itself to catch that.
+PRIOR_HIGH_LOOKBACK_WEEKS = 156     # ~3 years, measured BEFORE the crossover
+MAX_PRIOR_HIGH_OVERHANG_PCT = 8.0   # Reject if within 8% below a pre-existing multi-year high
+
+# Pullback Sequence Limit
+# Counts distinct touches of the 10W/20W EMA since the crossover so we only
+# accept the 1st or 2nd pullback of a genuinely young trend, not a 3rd/4th
+# pullback that's really a maturing base.
+MAX_PULLBACK_NUMBER = 2
+
 # Volume Signatures
 VOL_ABSORPTION_MAX_RVOL = 0.80     # Volume dry-up threshold during base rest
 HIGH_VOL_IGNITION_RATIO = 1.25     # Ignition volume on breakout turn
@@ -197,6 +212,8 @@ class ScanResult:
     weeks_since_crossover: int = 0
     post_cross_gain_pct: float = 0.0
     dist_from_40w_pct: float = 0.0
+    prior_high_overhang_pct: float = 0.0
+    pullback_number: int = 1
 
 # ---------------------------------------------------------------------------
 # Data Fetching & Technical Indicators
@@ -333,6 +350,20 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     if not (MIN_INITIAL_THRUST_PCT <= initial_thrust_pct <= MAX_INITIAL_THRUST_PCT):
         return None  # Rejects weak crossovers (< +25%) or overextended blow-offs (> +85%)
 
+    # --- 3b. LONG-TERM OVERHANG CHECK ---
+    # Look further back than the crossover for a pre-existing multi-year high.
+    # Reject if price is sitting just below it (0% to 8% under) — that's the
+    # "running into old resistance" zone. Already having cleared it (negative
+    # overhang) or being far below it (> 8%) is fine.
+    prior_high_start = max(0, crossover_idx - PRIOR_HIGH_LOOKBACK_WEEKS)
+    prior_high = df["high"].iloc[prior_high_start:crossover_idx].max() if crossover_idx > prior_high_start else None
+
+    overhang_pct = 0.0
+    if prior_high is not None and pd.notna(prior_high) and prior_high > 0:
+        overhang_pct = round((prior_high - row.close) / prior_high * 100, 2)
+        if 0 <= overhang_pct <= MAX_PRIOR_HIGH_OVERHANG_PCT:
+            return None  # Too close to a pre-existing multi-year high — not a clean young inception
+
     # --- 4. YOUNG PROXIMITY GATE: RESTING NEAR 40W BASELINE ---
     # Rejects extended runners sitting far above 40W EMA (must be within 8% to 28%)
     dist_from_40w = (row.close - row.ema40) / row.ema40 * 100
@@ -353,6 +384,25 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         return None
 
     pullback_ema = "10W" if abs(row.close - row.ema10) <= abs(row.close - row.ema20) else "20W"
+
+    # --- 6b. PULLBACK SEQUENCE NUMBER ---
+    # Count distinct touch episodes of the 10W/20W EMA since the crossover
+    # (consecutive touching weeks count as one episode). Reject anything past
+    # the 2nd pullback — that's no longer a "young" trend.
+    prev_touch_flag = False
+    pullback_number = 0
+    for j in range(crossover_idx, idx + 1):
+        bar = df.iloc[j]
+        touch_flag = (bar.low <= bar.ema10 * (1 + NEAR_EMA_TOLERANCE_PCT)) or \
+                     (bar.low <= bar.ema20 * (1 + NEAR_EMA_TOLERANCE_PCT))
+        if touch_flag and not prev_touch_flag:
+            pullback_number += 1
+        prev_touch_flag = touch_flag
+
+    if pullback_number == 0:
+        pullback_number = 1  # current bar is itself the touch in edge cases
+    if pullback_number > MAX_PULLBACK_NUMBER:
+        return None  # 3rd+ pullback — trend is maturing, not young anymore
 
     # --- 7. TIGHT CANDLE ANATOMY & LOWER WICK REJECTION ---
     candle_range = row.high - row.low
@@ -412,6 +462,8 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         "weeks_since_crossover": weeks_since_crossover,
         "post_cross_gain_pct": round(initial_thrust_pct, 1),
         "dist_from_40w_pct": round(dist_from_40w, 1),
+        "prior_high_overhang_pct": overhang_pct,
+        "pullback_number": pullback_number,
         "setup_type": "🔥 Base-1 Inception Pivot" if is_ignition_turn else "🛡️ Base-1 Shallow Absorption",
     }
 
@@ -445,6 +497,8 @@ def _build_scan_result(evald: dict) -> ScanResult:
         weeks_since_crossover=evald["weeks_since_crossover"],
         post_cross_gain_pct=evald["post_cross_gain_pct"],
         dist_from_40w_pct=evald["dist_from_40w_pct"],
+        prior_high_overhang_pct=evald.get("prior_high_overhang_pct", 0.0),
+        pullback_number=evald.get("pullback_number", 1),
     )
 
 # ---------------------------------------------------------------------------
@@ -510,7 +564,8 @@ def format_results_message(buy_setups: List[ScanResult]) -> str:
             f"⭐ *{r.symbol}* [{r.sector}] — `{r.setup_type}`\n"
             f"   • Close: ₹{r.close} | Support: *{r.pullback_ema} EMA* | Spread: {r.ema_spread_pct}%\n"
             f"   • Crossover Age: *{r.weeks_since_crossover}w ago* (Initial Thrust: +{r.post_cross_gain_pct}%)\n"
-            f"   • Proximity to 40W Baseline: *+{r.dist_from_40w_pct}%* (Young Trend)\n"
+            f"   • Pullback #: *{r.pullback_number}* | Proximity to 40W Baseline: *+{r.dist_from_40w_pct}%* (Young Trend)\n"
+            f"   • Prior-High Overhang: *{r.prior_high_overhang_pct:+.1f}%* (neg = already cleared)\n"
             f"   • RVOL: *{r.breakout_vol_ratio}x* | RSI: {r.rsi14} | ADX: {r.adx14}\n"
             f"   • vwRS (vs Nifty 500): *{r.rs_vs_market_pct:+.1f}* | vs Sector: *{r.rs_vs_sector_pct:+.1f}*\n"
             f"   • Off 52W High: -{r.dist_from_52w_high_pct}%\n"
