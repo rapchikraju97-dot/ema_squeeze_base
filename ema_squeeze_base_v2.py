@@ -2,11 +2,12 @@
 EMA Squeeze Base Scanner v2 — Stage-2 (Base-1 & Base-2) Absorption Engine
 -------------------------------------------------------------------------
 Coverage: Nifty Total Market (750 Equities)
-Captures:
-  1. Base-1 Inceptions (10–26w post-crossover)
-  2. Base-2 Structural Consolidations (26–40w post-crossover)
-  3. Absorption Volume Dry-up (RVOL <= 0.85x) & Breakout Pivots (RVOL >= 1.25x)
-  4. Continuous 40W EMA Defense + Positive Dual Rolling vwRS (Market & Sector)
+Features:
+  1. Base-1 Inceptions (8–24w post-crossover) & Base-2 Resets (25–40w post-crossover).
+  2. Absorption Volume Dry-up (RVOL <= 0.85x) vs Breakout Turns (RVOL >= 1.25x).
+  3. Continuous 40W EMA Defense + Zero Overhead Structural Damage.
+  4. Dynamic vwRS: Evaluates Stock vs Nifty 500 and Sector Index (skips gracefully if unassigned).
+  5. Thread-safe debugging diagnostics and multi-chunk Telegram alerts.
 """
 
 import argparse
@@ -17,7 +18,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
@@ -29,12 +30,12 @@ from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator
 
 # ---------------------------------------------------------------------------
-# Calibrated Strategy Parameters (Base-1 + Base-2 Coverage)
+# Strategy Parameters (Base-1 + Base-2 Coverage)
 # ---------------------------------------------------------------------------
 
 NEAR_EMA_TOLERANCE_PCT = 0.028     # 2.8% proximity to 10W / 20W EMA pocket
 SUPPORT_CLOSE_TOLERANCE_PCT = 2.0  # Max buffer below 20W EMA line
-MAX_PCT_OFF_52W_HIGH = 28.0        # Tight distance from recent 52W highs
+MAX_PCT_OFF_52W_HIGH = 28.0        # Max distance from 52W high
 
 # Stage-2 Expansion & Base Bounds
 MIN_WEEKS_SINCE_CROSSOVER = 8      # Minimum maturity post-Stage 1 cross
@@ -58,7 +59,6 @@ RS_LOOKBACK_WEEKS = 12             # Rolling vwRS window
 
 MARKET_INDEX_TICKER = "^CRSLDX"    # Nifty 500
 MARKET_INDEX_LABEL = "Nifty 500"
-FALLBACK_SECTOR_INDEX_TICKER = "^CRSLDX"
 
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_BACKOFF_SECONDS = [1, 3, 6]
@@ -76,7 +76,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 # ---------------------------------------------------------------------------
-# Sector Benchmarks & Universe
+# Sector Benchmarks & Universe Mapping
 # ---------------------------------------------------------------------------
 
 SECTOR_BENCHMARK_MAP = {
@@ -91,6 +91,78 @@ SECTOR_BENCHMARK_MAP = {
     "Realty": "^CNXREALTY",
     "Capital Goods": "^CRSLDX",
     "Consumer Durables": "^CNXCONSUM",
+}
+
+SECTOR_ASSIGNMENTS = {
+    "360ONE": "Financial Services", "ABB": "Capital Goods", "ACC": "Capital Goods",
+    "APLAPOLLO": "Capital Goods", "AUBANK": "Financial Services", "ADANIENT": "Metals & Mining",
+    "ADANIPORTS": "Services", "ADANIPOWER": "Power", "ABCAPITAL": "Financial Services",
+    "AFFLE": "Information Technology", "AJANTPHARM": "Healthcare", "ALKEM": "Healthcare",
+    "AMBER": "Consumer Durables", "AMBUJACEM": "Capital Goods", "ANGELONE": "Financial Services",
+    "APARINDS": "Capital Goods", "APOLLOHOSP": "Healthcare", "APOLLOTYRE": "Automobile and Auto Components",
+    "ASHOKLEY": "Automobile and Auto Components", "ASTRAL": "Capital Goods", "AUROPHARMA": "Healthcare",
+    "DMART": "Fast Moving Consumer Goods", "AXISBANK": "Financial Services", "BEML": "Capital Goods",
+    "BSE": "Financial Services", "BAJAJ-AUTO": "Automobile and Auto Components", "BAJFINANCE": "Financial Services",
+    "BAJAJFINSV": "Financial Services", "BALKRISIND": "Automobile and Auto Components", "BANKBARODA": "Financial Services",
+    "BEL": "Capital Goods", "BHARATFORG": "Automobile and Auto Components", "BHEL": "Capital Goods",
+    "BPCL": "Oil Gas & Consumable Fuels", "BHARTIARTL": "Information Technology", "BIOCON": "Healthcare",
+    "BSOFT": "Information Technology", "BLUESTARCO": "Consumer Durables", "BOSCHLTD": "Automobile and Auto Components",
+    "BRITANNIA": "Fast Moving Consumer Goods", "CESC": "Power", "CGPOWER": "Capital Goods",
+    "CDSL": "Financial Services", "CIPLA": "Healthcare", "COALINDIA": "Metals & Mining",
+    "COCHINSHIP": "Capital Goods", "COFORGE": "Information Technology", "COLPAL": "Fast Moving Consumer Goods",
+    "CAMS": "Financial Services", "CONCOR": "Services", "CUMMINSIND": "Capital Goods",
+    "CYIENT": "Information Technology", "DLF": "Realty", "DABUR": "Fast Moving Consumer Goods",
+    "DALBHARAT": "Capital Goods", "DATAPATTNS": "Capital Goods", "DEEPAKNTR": "Healthcare",
+    "DELHIVERY": "Services", "DIVISLAB": "Healthcare", "DIXON": "Consumer Durables",
+    "DRREDDY": "Healthcare", "EICHERMOT": "Automobile and Auto Components", "ELECON": "Capital Goods",
+    "ELGIEQUIP": "Capital Goods", "EMAMILTD": "Fast Moving Consumer Goods", "EXIDEIND": "Automobile and Auto Components",
+    "NYKAA": "Fast Moving Consumer Goods", "FEDERALBNK": "Financial Services", "GAIL": "Oil Gas & Consumable Fuels",
+    "GRSE": "Capital Goods", "GLENMARK": "Healthcare", "GODREJCP": "Fast Moving Consumer Goods",
+    "GODREJPROP": "Realty", "GRASIM": "Capital Goods", "GRAVITA": "Metals & Mining",
+    "HCLTECH": "Information Technology", "HDFCAMC": "Financial Services", "HDFCBANK": "Financial Services",
+    "HDFCLIFE": "Financial Services", "HAVELLS": "Consumer Durables", "HAL": "Capital Goods",
+    "HINDALCO": "Metals & Mining", "HINDPETRO": "Oil Gas & Consumable Fuels", "HINDUNILVR": "Fast Moving Consumer Goods",
+    "HUDCO": "Financial Services", "ICICIBANK": "Financial Services", "ICICIGI": "Financial Services",
+    "ICICIPRULI": "Financial Services", "IDFCFIRSTB": "Financial Services", "IIFL": "Financial Services",
+    "INDIANB": "Financial Services", "INDHOTEL": "Services", "IOC": "Oil Gas & Consumable Fuels",
+    "IRCTC": "Services", "IRFC": "Financial Services", "IREDA": "Financial Services",
+    "INDUSTOWER": "Information Technology", "INDUSINDBK": "Financial Services", "NAUKRI": "Information Technology",
+    "INFY": "Information Technology", "INOXWIND": "Power", "INDIGO": "Services",
+    "IPCALAB": "Healthcare", "JKCEMENT": "Capital Goods", "JSWENERGY": "Power",
+    "JSWINFRA": "Services", "JSWSTEEL": "Metals & Mining", "JINDALSTEL": "Metals & Mining",
+    "JIOFIN": "Financial Services", "JUBLFOOD": "Fast Moving Consumer Goods", "JWL": "Capital Goods",
+    "KAYNES": "Capital Goods", "KEI": "Capital Goods", "KOTAKBANK": "Financial Services",
+    "LTF": "Financial Services", "LTTS": "Information Technology", "LT": "Capital Goods",
+    "LAURUSLABS": "Healthcare", "LICI": "Financial Services", "LODHA": "Realty",
+    "LUPIN": "Healthcare", "M&MFIN": "Financial Services", "M&M": "Automobile and Auto Components",
+    "MANKIND": "Healthcare", "MARICO": "Fast Moving Consumer Goods", "MARUTI": "Automobile and Auto Components",
+    "MAXHEALTH": "Healthcare", "MAZDOCK": "Capital Goods", "MCX": "Financial Services",
+    "MUTHOOTFIN": "Financial Services", "NATCOPHARM": "Healthcare", "NBCC": "Realty",
+    "NCC": "Capital Goods", "NHPC": "Power", "NMDC": "Metals & Mining",
+    "NTPC": "Power", "NATIONALUM": "Metals & Mining", "NAVINFLUOR": "Healthcare",
+    "NESTLEIND": "Fast Moving Consumer Goods", "NETWEB": "Information Technology", "OBEROIRLTY": "Realty",
+    "ONGC": "Oil Gas & Consumable Fuels", "OIL": "Oil Gas & Consumable Fuels", "PAYTM": "Financial Services",
+    "OFSS": "Information Technology", "POLICYBZR": "Financial Services", "PCBL": "Chemicals",
+    "PGEL": "Consumer Durables", "PIIND": "Healthcare", "PNBHOUSING": "Financial Services",
+    "PERSISTENT": "Information Technology", "PETRONET": "Oil Gas & Consumable Fuels", "PHOENIXLTD": "Realty",
+    "PIDILITIND": "Fast Moving Consumer Goods", "POLYCAB": "Capital Goods", "POONAWALLA": "Financial Services",
+    "PFC": "Financial Services", "POWERGRID": "Power", "PRESTIGE": "Realty",
+    "PNB": "Financial Services", "RVNL": "Capital Goods", "RAILTEL": "Information Technology",
+    "RATNAMANI": "Capital Goods", "RELIANCE": "Oil Gas & Consumable Fuels", "SBICARD": "Financial Services",
+    "SBILIFE": "Financial Services", "SJVN": "Power", "MOTHERSON": "Automobile and Auto Components",
+    "SCHNEIDER": "Capital Goods", "SHREECEM": "Capital Goods", "SHRIRAMFIN": "Financial Services",
+    "SIEMENS": "Capital Goods", "SOLARINDS": "Capital Goods", "SONACOMS": "Automobile and Auto Components",
+    "SBIN": "Financial Services", "SAIL": "Metals & Mining", "SWSOLAR": "Power",
+    "SUNPHARMA": "Healthcare", "SUNTV": "Services", "SUNDARMFIN": "Financial Services",
+    "SUZLON": "Power", "TDPOWERSYS": "Capital Goods", "TVSMOTOR": "Automobile and Auto Components",
+    "TCS": "Information Technology", "TATACONSUM": "Fast Moving Consumer Goods", "TATAPOWER": "Power",
+    "TATASTEEL": "Metals & Mining", "TATATECH": "Information Technology", "TECHM": "Information Technology",
+    "TITAGARH": "Capital Goods", "TITAN": "Consumer Durables", "TORNTPHARM": "Healthcare",
+    "TORNTPOWER": "Power", "TRENT": "Fast Moving Consumer Goods", "TIINDIA": "Automobile and Auto Components",
+    "ULTRACEMCO": "Capital Goods", "UNIONBANK": "Financial Services", "UNITDSPR": "Fast Moving Consumer Goods",
+    "VBL": "Fast Moving Consumer Goods", "VEDL": "Metals & Mining", "VOLTAS": "Consumer Durables",
+    "WIPRO": "Information Technology", "ZENTEC": "Capital Goods", "ZENSARTECH": "Information Technology",
+    "ZYDUSLIFE": "Healthcare"
 }
 
 SYMBOLS = [
@@ -190,78 +262,6 @@ SYMBOLS = [
     "ZFCVINDIA", "ZAGGLE", "ZEEL", "ZENTEC", "ZENSARTECH", "ZYDUSLIFE", "ZYDUSWELL", "ECLERX"
 ]
 
-SECTOR_ASSIGNMENTS = {
-    "360ONE": "Financial Services", "ABB": "Capital Goods", "ACC": "Capital Goods",
-    "APLAPOLLO": "Capital Goods", "AUBANK": "Financial Services", "ADANIENT": "Metals & Mining",
-    "ADANIPORTS": "Services", "ADANIPOWER": "Power", "ABCAPITAL": "Financial Services",
-    "AFFLE": "Information Technology", "AJANTPHARM": "Healthcare", "ALKEM": "Healthcare",
-    "AMBER": "Consumer Durables", "AMBUJACEM": "Capital Goods", "ANGELONE": "Financial Services",
-    "APARINDS": "Capital Goods", "APOLLOHOSP": "Healthcare", "APOLLOTYRE": "Automobile and Auto Components",
-    "ASHOKLEY": "Automobile and Auto Components", "ASTRAL": "Capital Goods", "AUROPHARMA": "Healthcare",
-    "DMART": "Fast Moving Consumer Goods", "AXISBANK": "Financial Services", "BEML": "Capital Goods",
-    "BSE": "Financial Services", "BAJAJ-AUTO": "Automobile and Auto Components", "BAJFINANCE": "Financial Services",
-    "BAJAJFINSV": "Financial Services", "BALKRISIND": "Automobile and Auto Components", "BANKBARODA": "Financial Services",
-    "BEL": "Capital Goods", "BHARATFORG": "Automobile and Auto Components", "BHEL": "Capital Goods",
-    "BPCL": "Oil Gas & Consumable Fuels", "BHARTIARTL": "Information Technology", "BIOCON": "Healthcare",
-    "BSOFT": "Information Technology", "BLUESTARCO": "Consumer Durables", "BOSCHLTD": "Automobile and Auto Components",
-    "BRITANNIA": "Fast Moving Consumer Goods", "CESC": "Power", "CGPOWER": "Capital Goods",
-    "CDSL": "Financial Services", "CIPLA": "Healthcare", "COALINDIA": "Metals & Mining",
-    "COCHINSHIP": "Capital Goods", "COFORGE": "Information Technology", "COLPAL": "Fast Moving Consumer Goods",
-    "CAMS": "Financial Services", "CONCOR": "Services", "CUMMINSIND": "Capital Goods",
-    "CYIENT": "Information Technology", "DLF": "Realty", "DABUR": "Fast Moving Consumer Goods",
-    "DALBHARAT": "Capital Goods", "DATAPATTNS": "Capital Goods", "DEEPAKNTR": "Healthcare",
-    "DELHIVERY": "Services", "DIVISLAB": "Healthcare", "DIXON": "Consumer Durables",
-    "DRREDDY": "Healthcare", "EICHERMOT": "Automobile and Auto Components", "ELECON": "Capital Goods",
-    "ELGIEQUIP": "Capital Goods", "EMAMILTD": "Fast Moving Consumer Goods", "EXIDEIND": "Automobile and Auto Components",
-    "NYKAA": "Fast Moving Consumer Goods", "FEDERALBNK": "Financial Services", "GAIL": "Oil Gas & Consumable Fuels",
-    "GRSE": "Capital Goods", "GLENMARK": "Healthcare", "GODREJCP": "Fast Moving Consumer Goods",
-    "GODREJPROP": "Realty", "GRASIM": "Capital Goods", "GRAVITA": "Metals & Mining",
-    "HCLTECH": "Information Technology", "HDFCAMC": "Financial Services", "HDFCBANK": "Financial Services",
-    "HDFCLIFE": "Financial Services", "HAVELLS": "Consumer Durables", "HAL": "Capital Goods",
-    "HINDALCO": "Metals & Mining", "HINDPETRO": "Oil Gas & Consumable Fuels", "HINDUNILVR": "Fast Moving Consumer Goods",
-    "HUDCO": "Financial Services", "ICICIBANK": "Financial Services", "ICICIGI": "Financial Services",
-    "ICICIPRULI": "Financial Services", "IDFCFIRSTB": "Financial Services", "IIFL": "Financial Services",
-    "INDIANB": "Financial Services", "INDHOTEL": "Services", "IOC": "Oil Gas & Consumable Fuels",
-    "IRCTC": "Services", "IRFC": "Financial Services", "IREDA": "Financial Services",
-    "INDUSTOWER": "Information Technology", "INDUSINDBK": "Financial Services", "NAUKRI": "Information Technology",
-    "INFY": "Information Technology", "INOXWIND": "Power", "INDIGO": "Services",
-    "IPCALAB": "Healthcare", "JKCEMENT": "Capital Goods", "JSWENERGY": "Power",
-    "JSWINFRA": "Services", "JSWSTEEL": "Metals & Mining", "JINDALSTEL": "Metals & Mining",
-    "JIOFIN": "Financial Services", "JUBLFOOD": "Fast Moving Consumer Goods", "JWL": "Capital Goods",
-    "KAYNES": "Capital Goods", "KEI": "Capital Goods", "KOTAKBANK": "Financial Services",
-    "LTF": "Financial Services", "LTTS": "Information Technology", "LT": "Capital Goods",
-    "LAURUSLABS": "Healthcare", "LICI": "Financial Services", "LODHA": "Realty",
-    "LUPIN": "Healthcare", "M&MFIN": "Financial Services", "M&M": "Automobile and Auto Components",
-    "MANKIND": "Healthcare", "MARICO": "Fast Moving Consumer Goods", "MARUTI": "Automobile and Auto Components",
-    "MAXHEALTH": "Healthcare", "MAZDOCK": "Capital Goods", "MCX": "Financial Services",
-    "MUTHOOTFIN": "Financial Services", "NATCOPHARM": "Healthcare", "NBCC": "Realty",
-    "NCC": "Capital Goods", "NHPC": "Power", "NMDC": "Metals & Mining",
-    "NTPC": "Power", "NATIONALUM": "Metals & Mining", "NAVINFLUOR": "Healthcare",
-    "NESTLEIND": "Fast Moving Consumer Goods", "NETWEB": "Information Technology", "OBEROIRLTY": "Realty",
-    "ONGC": "Oil Gas & Consumable Fuels", "OIL": "Oil Gas & Consumable Fuels", "PAYTM": "Financial Services",
-    "OFSS": "Information Technology", "POLICYBZR": "Financial Services", "PCBL": "Chemicals",
-    "PGEL": "Consumer Durables", "PIIND": "Healthcare", "PNBHOUSING": "Financial Services",
-    "PERSISTENT": "Information Technology", "PETRONET": "Oil Gas & Consumable Fuels", "PHOENIXLTD": "Realty",
-    "PIDILITIND": "Fast Moving Consumer Goods", "POLYCAB": "Capital Goods", "POONAWALLA": "Financial Services",
-    "PFC": "Financial Services", "POWERGRID": "Power", "PRESTIGE": "Realty",
-    "PNB": "Financial Services", "RVNL": "Capital Goods", "RAILTEL": "Information Technology",
-    "RATNAMANI": "Capital Goods", "RELIANCE": "Oil Gas & Consumable Fuels", "SBICARD": "Financial Services",
-    "SBILIFE": "Financial Services", "SJVN": "Power", "MOTHERSON": "Automobile and Auto Components",
-    "SCHNEIDER": "Capital Goods", "SHREECEM": "Capital Goods", "SHRIRAMFIN": "Financial Services",
-    "SIEMENS": "Capital Goods", "SOLARINDS": "Capital Goods", "SONACOMS": "Automobile and Auto Components",
-    "SBIN": "Financial Services", "SAIL": "Metals & Mining", "SWSOLAR": "Power",
-    "SUNPHARMA": "Healthcare", "SUNTV": "Services", "SUNDARMFIN": "Financial Services",
-    "SUZLON": "Power", "TDPOWERSYS": "Capital Goods", "TVSMOTOR": "Automobile and Auto Components",
-    "TCS": "Information Technology", "TATACONSUM": "Fast Moving Consumer Goods", "TATAPOWER": "Power",
-    "TATASTEEL": "Metals & Mining", "TATATECH": "Information Technology", "TECHM": "Information Technology",
-    "TITAGARH": "Capital Goods", "TITAN": "Consumer Durables", "TORNTPHARM": "Healthcare",
-    "TORNTPOWER": "Power", "TRENT": "Fast Moving Consumer Goods", "TIINDIA": "Automobile and Auto Components",
-    "ULTRACEMCO": "Capital Goods", "UNIONBANK": "Financial Services", "UNITDSPR": "Fast Moving Consumer Goods",
-    "VBL": "Fast Moving Consumer Goods", "VEDL": "Metals & Mining", "VOLTAS": "Consumer Durables",
-    "WIPRO": "Information Technology", "ZENTEC": "Capital Goods", "ZENSARTECH": "Information Technology",
-    "ZYDUSLIFE": "Healthcare"
-}
-
 # ---------------------------------------------------------------------------
 # Data Models
 # ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ class ScanResult:
     week_date: str
     sector: str = ""
     rs_vs_market_pct: float = 0.0
-    rs_vs_sector_pct: float = 0.0
+    rs_vs_sector_pct: Optional[float] = None
     dist_from_52w_high_pct: float = 0.0
     breakout_vol_ratio: float = 0.0
     vol_contracting: bool = False
@@ -300,7 +300,7 @@ class ScanResult:
     pullback_number: int = 1
 
 # ---------------------------------------------------------------------------
-# Data Fetching & Indicators
+# Technical Calculations
 # ---------------------------------------------------------------------------
 
 def _download_with_retry(ticker: str, period: str = "5y", request_delay: float = 0.0) -> Optional[pd.DataFrame]:
@@ -384,11 +384,11 @@ def compute_volume_weighted_rs_series(stock_weekly: pd.DataFrame, benchmark_week
 # Setup Evaluator: Base-1 & Base-2 Absorption Engine
 # ---------------------------------------------------------------------------
 
-def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs_sec_series: pd.Series,
-                        debug_counts: dict = None) -> Optional[dict]:
+def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs_sec_series: Optional[pd.Series],
+                        debug_callback=None) -> Optional[dict]:
     def _reject(stage: str):
-        if debug_counts is not None:
-            debug_counts[stage] = debug_counts.get(stage, 0) + 1
+        if debug_callback is not None:
+            debug_callback(stage)
         return None
 
     if idx < 45 or idx >= len(df):
@@ -505,14 +505,20 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
     if not (is_dry_absorption or is_ignition_turn):
         return _reject("8_volume_signature_fail")
 
-    # --- 9. POSITIVE DUAL RELATIVE STRENGTH (vwRS) ---
+    # --- 9. RELATIVE STRENGTH (vwRS) ---
+    # Market RS is strictly mandatory (must be non-negative)
     vw_rs_mkt = rs_mkt_series.asof(row.name) if not rs_mkt_series.empty else np.nan
-    vw_rs_sec = rs_sec_series.asof(row.name) if not rs_sec_series.empty else np.nan
-
     if pd.isna(vw_rs_mkt) or vw_rs_mkt < 0.0:
         return _reject("9_rs_market_negative")
-    if pd.notna(vw_rs_sec) and vw_rs_sec < -0.5:
-        return _reject("9_rs_sector_negative")
+
+    # Sector RS check is executed ONLY if a valid sector series exists
+    vw_rs_sec = None
+    if rs_sec_series is not None and not rs_sec_series.empty:
+        sec_val = rs_sec_series.asof(row.name)
+        if pd.notna(sec_val):
+            if sec_val < 0.0:
+                return _reject("9_rs_sector_negative")
+            vw_rs_sec = float(sec_val)
 
     # Distance from 52W High
     high_52w = row.get("high_52w", float("nan"))
@@ -535,7 +541,7 @@ def evaluate_conditions(df: pd.DataFrame, idx: int, rs_mkt_series: pd.Series, rs
         "risk_pct": risk_pct,
         "rvol": rvol,
         "vw_rs_mkt": vw_rs_mkt,
-        "vw_rs_sec": 0.0 if pd.isna(vw_rs_sec) else vw_rs_sec,
+        "vw_rs_sec": vw_rs_sec,
         "ema_spread_pct": ema_spread_pct,
         "weeks_since_crossover": weeks_since_crossover,
         "post_cross_gain_pct": round(initial_thrust_pct, 1),
@@ -584,7 +590,7 @@ def _build_scan_result(evald: dict) -> ScanResult:
 # ---------------------------------------------------------------------------
 
 def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, backtest: bool, lookback_weeks: int,
-                weekly_cache: dict = None, request_delay: float = 0.0, debug_counts: dict = None):
+                weekly_cache: dict = None, request_delay: float = 0.0, debug_callback=None):
     daily = _download_with_retry(f"{symbol}.NS", period="5y", request_delay=request_delay)
     if daily is None:
         return []
@@ -597,24 +603,24 @@ def scan_symbol(symbol: str, market_weekly: pd.DataFrame, sector_cache: dict, ba
         weekly_cache[symbol] = weekly
 
     sector = SECTOR_ASSIGNMENTS.get(symbol, "Other")
-    sec_ticker = SECTOR_BENCHMARK_MAP.get(sector, FALLBACK_SECTOR_INDEX_TICKER)
-    sector_weekly = sector_cache.get(sec_ticker, market_weekly)
+    sec_ticker = SECTOR_BENCHMARK_MAP.get(sector, None)
+    sector_weekly = sector_cache.get(sec_ticker, None) if sec_ticker else None
 
     rs_mkt_series = compute_volume_weighted_rs_series(weekly, market_weekly)
-    rs_sec_series = compute_volume_weighted_rs_series(weekly, sector_weekly)
+    rs_sec_series = compute_volume_weighted_rs_series(weekly, sector_weekly) if sector_weekly is not None else None
 
     results = []
     if backtest:
         start_idx = max(45, len(weekly) - lookback_weeks)
         for i in range(start_idx, len(weekly)):
-            evald = evaluate_conditions(weekly, i, rs_mkt_series, rs_sec_series, debug_counts)
+            evald = evaluate_conditions(weekly, i, rs_mkt_series, rs_sec_series, debug_callback)
             if evald:
                 res = _build_scan_result(evald)
                 res.symbol = symbol
                 res.sector = sector
                 results.append(res)
     else:
-        evald = evaluate_conditions(weekly, len(weekly) - 1, rs_mkt_series, rs_sec_series, debug_counts)
+        evald = evaluate_conditions(weekly, len(weekly) - 1, rs_mkt_series, rs_sec_series, debug_callback)
         if evald:
             res = _build_scan_result(evald)
             res.symbol = symbol
@@ -638,6 +644,7 @@ def format_results_message(buy_setups: List[ScanResult]) -> str:
 
     lines.append(f"🎯 *QUALIFIED STAGE-2 SETUPS ({len(buy_setups)})*\n")
     for r in buy_setups:
+        sec_rs_str = f"*{r.rs_vs_sector_pct:+.1f}*" if r.rs_vs_sector_pct is not None else "`N/A (Unmapped)`"
         lines.append(
             f"⭐ *{r.symbol}* [{r.sector}] — `{r.setup_type}`\n"
             f"   • Close: ₹{r.close} | Support: *{r.pullback_ema} EMA* | Spread: {r.ema_spread_pct}%\n"
@@ -645,7 +652,7 @@ def format_results_message(buy_setups: List[ScanResult]) -> str:
             f"   • Pullback #: *{r.pullback_number}* | Proximity to 40W: *+{r.dist_from_40w_pct}%*\n"
             f"   • Prior-High Overhang: *{r.prior_high_overhang_pct:+.1f}%*\n"
             f"   • RVOL: *{r.breakout_vol_ratio}x* | RSI: {r.rsi14} | ADX: {r.adx14}\n"
-            f"   • vwRS (vs Nifty 500): *{r.rs_vs_market_pct:+.1f}* | vs Sector: *{r.rs_vs_sector_pct:+.1f}*\n"
+            f"   • vwRS (vs Nifty 500): *{r.rs_vs_market_pct:+.1f}* | vs Sector: {sec_rs_str}\n"
             f"   • Off 52W High: -{r.dist_from_52w_high_pct}%\n"
             f"   • 🎯 SL Anchor: ₹{r.stop_loss} ({r.risk_pct}% Risk Box)\n"
         )
@@ -721,7 +728,7 @@ def log_matches_to_history(results: List[ScanResult], csv_path: str = MATCH_HIST
             "close_at_match": r.close,
             "ema10_at_match": r.ema10,
             "rs_vs_market_at_match": r.rs_vs_market_pct,
-            "rs_vs_sector_at_match": r.rs_vs_sector_pct,
+            "rs_vs_sector_at_match": r.rs_vs_sector_pct if r.rs_vs_sector_pct is not None else "",
             "monthly_confirmed": True,
             "buy_tag": r.buy_tag,
             "pullback_ema": r.pullback_ema or "",
@@ -781,12 +788,18 @@ def main():
     all_candidates: List[ScanResult] = []
     weekly_cache = {} if args.backtest else None
     debug_counts = {} if args.debug else None
+    debug_lock = threading.Lock() if args.debug else None
+
+    def thread_safe_debug_record(stage: str):
+        if debug_counts is not None and debug_lock is not None:
+            with debug_lock:
+                debug_counts[stage] = debug_counts.get(stage, 0) + 1
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
                 scan_symbol, s, market_weekly, sector_cache, args.backtest, args.lookback_weeks,
-                weekly_cache, args.delay, debug_counts
+                weekly_cache, args.delay, thread_safe_debug_record if args.debug else None
             ): s
             for s in symbols
         }
