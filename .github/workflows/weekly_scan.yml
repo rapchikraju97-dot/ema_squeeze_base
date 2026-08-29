@@ -1,43 +1,34 @@
-name: EMA Squeeze Base Weekly Scan
+name: Weekly EMA Absorption Scanner
 
 on:
   schedule:
-    # Monday + Friday, 18:00 IST = 12:30 UTC
-    - cron: '30 12 * * 1,5'
-  workflow_dispatch: {}
+    # Runs every Friday at 11:00 AM UTC (4:30 PM IST)
+    - cron: '0 11 * * 5'
+    # Optional weekend run: Every Sunday at 04:30 AM UTC (10:00 AM IST)
+    - cron: '30 4 * * 0'
+  workflow_dispatch: # Allows manual one-click trigger anytime from GitHub Actions tab
 
 jobs:
-  scan:
+  run-scanner:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
     steps:
-      - name: Checkout repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy requests yfinance ta
 
-      - name: Run scanner
+      - name: Run Weekly Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python ema_squeeze_base_v2.py
-
-      - name: Commit match history
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add match_history.csv || true
-          git commit -m "Auto-update match history [skip ci]" || echo "No changes to commit"
-          git push || echo "Push skipped"
